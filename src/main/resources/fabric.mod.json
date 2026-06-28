@@ -1,0 +1,31 @@
+{
+	"schemaVersion": 1,
+	"id": "nestedchest",
+	"version": "${version}",
+	"name": "Nested Chest",
+	"description": "Open chest items inside chest inventories as draggable nested windows.",
+	"authors": [
+		"Codex",
+		"xc"
+	],
+	"contact": {},
+	"license": "MIT",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"com.xc.nestedchest.NestedChestMod"
+		],
+		"client": [
+			"com.xc.nestedchest.client.NestedChestClient"
+		]
+	},
+	"mixins": [
+		"nestedchest.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.16.0",
+		"fabric-api": "*",
+		"minecraft": "~1.21",
+		"java": ">=21"
+	}
+}

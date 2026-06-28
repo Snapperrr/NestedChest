@@ -1,0 +1,17 @@
+{
+	"required": true,
+	"package": "com.xc.nestedchest.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"client": [
+		"ChestBlockEntityRendererMixin",
+		"HandledScreenMixin",
+		"ScreenAccessor"
+	],
+	"mixins": [
+		"ChestBlockMixin",
+		"HopperBlockEntityMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}
