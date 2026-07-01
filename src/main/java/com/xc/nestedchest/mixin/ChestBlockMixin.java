@@ -34,7 +34,7 @@ public abstract class ChestBlockMixin {
 		}
 		BlockEntity blockEntity = world.getBlockEntity(pos);
 		if (blockEntity instanceof Inventory inventory) {
-			NestedChestMod.sanitizeChestDrops(inventory);
+			NestedChestMod.sanitizeChestDrops(world, pos, inventory);
 		}
 	}
 

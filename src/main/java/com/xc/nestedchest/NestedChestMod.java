@@ -1,13 +1,21 @@
 package com.xc.nestedchest;
 
+import com.mojang.logging.LogUtils;
+import com.xc.nestedchest.debug.NestedChestDebugCommands;
 import com.xc.nestedchest.network.NestedChestClickPayload;
+import com.xc.nestedchest.network.NestedChestOpenPayload;
 import com.xc.nestedchest.network.NestedChestRenamePayload;
+import com.xc.nestedchest.network.NestedChestSortPayload;
 import com.xc.nestedchest.network.NestedChestSyncPayload;
 import com.xc.nestedchest.screen.ConnectedChestScreenHandler;
+import com.xc.nestedchest.storage.NestedChestStorage;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.screenhandler.v1.ExtendedScreenHandlerType;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.ContainerComponent;
 import net.minecraft.inventory.Inventory;
@@ -17,22 +25,32 @@ import net.minecraft.item.Items;
 import net.minecraft.network.codec.PacketCodecs;
 import net.minecraft.registry.Registries;
 import net.minecraft.registry.Registry;
+import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.screen.GenericContainerScreenHandler;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.ScreenHandlerType;
 import net.minecraft.screen.slot.Slot;
 import net.minecraft.screen.slot.SlotActionType;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
+import net.minecraft.util.ItemScatterer;
 import net.minecraft.util.collection.DefaultedList;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.World;
+import org.slf4j.Logger;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 public class NestedChestMod implements ModInitializer {
+	private static final Logger LOGGER = LogUtils.getLogger();
 	public static final String MOD_ID = "nestedchest";
 	public static final ScreenHandlerType<ConnectedChestScreenHandler> CONNECTED_CHEST_SCREEN_HANDLER = Registry.register(
 			Registries.SCREEN_HANDLER,
@@ -43,26 +61,71 @@ public class NestedChestMod implements ModInitializer {
 	public static final int DOUBLE_NESTED_CHEST_SIZE = 54;
 	public static final int MAX_NESTED_CHEST_SIZE = DOUBLE_NESTED_CHEST_SIZE;
 	public static final int MAX_CHEST_NAME_LENGTH = 32;
+	private static final int DATABASE_CHECKPOINT_TICKS = 20 * 60;
+	private static final long SLOW_OPERATION_WARNING_NANOS = 50_000_000L;
 	private static final Map<UUID, QuickCraftSession> QUICK_CRAFT_SESSIONS = new HashMap<>();
+	private static final ThreadLocal<World> HOPPER_TRANSFER_WORLD = new ThreadLocal<>();
+	private static int checkpointTicks;
 
 	@Override
 	public void onInitialize() {
 		PayloadTypeRegistry.playC2S().register(NestedChestClickPayload.ID, NestedChestClickPayload.CODEC);
+		PayloadTypeRegistry.playC2S().register(NestedChestOpenPayload.ID, NestedChestOpenPayload.CODEC);
 		PayloadTypeRegistry.playC2S().register(NestedChestRenamePayload.ID, NestedChestRenamePayload.CODEC);
+		PayloadTypeRegistry.playC2S().register(NestedChestSortPayload.ID, NestedChestSortPayload.CODEC);
 		PayloadTypeRegistry.playS2C().register(NestedChestSyncPayload.ID, NestedChestSyncPayload.CODEC);
 		ServerPlayNetworking.registerGlobalReceiver(NestedChestClickPayload.ID, NestedChestMod::receiveNestedClick);
+		ServerPlayNetworking.registerGlobalReceiver(NestedChestOpenPayload.ID, NestedChestMod::receiveNestedOpen);
 		ServerPlayNetworking.registerGlobalReceiver(NestedChestRenamePayload.ID, NestedChestMod::receiveNestedRename);
+		ServerPlayNetworking.registerGlobalReceiver(NestedChestSortPayload.ID, NestedChestMod::receiveNestedSort);
+		ServerTickEvents.END_SERVER_TICK.register(NestedChestMod::checkpointStorage);
+		ServerLifecycleEvents.SERVER_STOPPING.register(server -> NestedChestStorage.closeAll());
+		NestedChestDebugCommands.register();
 	}
 
 	private static void receiveNestedClick(NestedChestClickPayload payload, ServerPlayNetworking.Context context) {
 		context.server().execute(() -> applyNestedClick(payload, context.player()));
 	}
 
+	private static void receiveNestedOpen(NestedChestOpenPayload payload, ServerPlayNetworking.Context context) {
+		context.server().execute(() -> syncNestedOpen(payload, context.player()));
+	}
+
 	private static void receiveNestedRename(NestedChestRenamePayload payload, ServerPlayNetworking.Context context) {
 		context.server().execute(() -> applyNestedRename(payload, context.player()));
 	}
 
+	private static void receiveNestedSort(NestedChestSortPayload payload, ServerPlayNetworking.Context context) {
+		context.server().execute(() -> applyNestedSort(payload, context.player()));
+	}
+
+	private static void checkpointStorage(MinecraftServer server) {
+		checkpointTicks++;
+		if (checkpointTicks < DATABASE_CHECKPOINT_TICKS) {
+			return;
+		}
+		checkpointTicks = 0;
+		NestedChestStorage.checkpointAll();
+	}
+
+	private static void syncNestedOpen(NestedChestOpenPayload payload, ServerPlayerEntity player) {
+		long start = System.nanoTime();
+		ScreenHandler handler = player.currentScreenHandler;
+		int containerSlots = containerSlotCount(handler);
+		if (containerSlots <= 0) {
+			return;
+		}
+
+		NestedChestStorage storage = NestedChestStorage.get(player.server);
+		ResolvedNestedContainer resolved = resolveNestedContainer(storage, handler, containerSlots, payload.path(), false);
+		if (resolved != null) {
+			sendNestedSync(player, resolved);
+		}
+		warnSlowOperation("open", payload.path(), start);
+	}
+
 	private static void applyNestedClick(NestedChestClickPayload payload, ServerPlayerEntity player) {
+		long start = System.nanoTime();
 		if ((payload.nestedSlot() != -999 && payload.nestedSlot() < 0) || payload.nestedSlot() >= MAX_NESTED_CHEST_SIZE + 36) {
 			return;
 		}
@@ -73,30 +136,38 @@ public class NestedChestMod implements ModInitializer {
 			return;
 		}
 
-		ResolvedNestedContainer resolved = resolveNestedContainer(handler, containerSlots, payload.path());
-		if (resolved == null || (payload.nestedSlot() >= 0 && payload.nestedSlot() >= resolved.size() + 36)) {
+		NestedChestStorage storage = NestedChestStorage.get(player.server);
+		ResolvedNestedContainer resolved = resolveNestedContainer(storage, handler, containerSlots, payload.path(), true);
+		if (resolved == null) {
+			return;
+		}
+		int nestedSlot = translateNestedClickSlot(resolved, payload.path(), payload.nestedSlot());
+		if (nestedSlot >= 0 && nestedSlot >= resolved.size() + 36) {
 			return;
 		}
 
 		if (payload.actionType() == SlotActionType.QUICK_CRAFT) {
-			runVanillaNestedQuickCraft(resolved, handler, player, payload.nestedSlot(), payload.button(), containerSlots);
+			runVanillaNestedQuickCraft(resolved, handler, player, nestedSlot, payload.button(), containerSlots);
 			return;
 		}
 
 		QUICK_CRAFT_SESSIONS.remove(player.getUuid());
-		runVanillaNestedClick(resolved, handler, player, payload.nestedSlot(), payload.button(), payload.actionType());
+		DefaultedList<ItemStack> updatedStacks = runVanillaNestedClick(storage, resolved, handler, player, nestedSlot, payload.button(), payload.actionType());
 		handler.sendContentUpdates();
-		syncPathAndAncestors(player, handler, containerSlots, resolved.path());
+		sendNestedSync(player, resolved.path(), updatedStacks);
+		warnSlowOperation("click", resolved.path(), start);
 	}
 
 	private static void applyNestedRename(NestedChestRenamePayload payload, ServerPlayerEntity player) {
+		long start = System.nanoTime();
 		ScreenHandler handler = player.currentScreenHandler;
 		int containerSlots = containerSlotCount(handler);
 		if (containerSlots <= 0) {
 			return;
 		}
 
-		ResolvedChest resolved = resolveChest(handler, containerSlots, payload.path());
+		NestedChestStorage storage = NestedChestStorage.get(player.server);
+		ResolvedChest resolved = resolveChest(storage, handler, containerSlots, payload.path());
 		if (resolved == null) {
 			return;
 		}
@@ -111,31 +182,131 @@ public class NestedChestMod implements ModInitializer {
 			resolved.stack().set(DataComponentTypes.CUSTOM_NAME, Text.literal(name));
 		}
 
-		writeResolvedChest(resolved);
+		writeResolvedChest(storage, resolved);
 		handler.sendContentUpdates();
-		syncPathAndAncestors(player, handler, containerSlots, payload.path());
+		syncPathAndAncestors(storage, player, handler, containerSlots, payload.path());
+		warnSlowOperation("rename", payload.path(), start);
+	}
+
+	private static void applyNestedSort(NestedChestSortPayload payload, ServerPlayerEntity player) {
+		long start = System.nanoTime();
+		ScreenHandler handler = player.currentScreenHandler;
+		int containerSlots = containerSlotCount(handler);
+		if (containerSlots <= 0 || payload.path().isEmpty()) {
+			return;
+		}
+
+		NestedChestStorage storage = NestedChestStorage.get(player.server);
+		ResolvedNestedContainer resolved = resolveNestedContainer(storage, handler, containerSlots, payload.path(), true);
+		if (resolved == null) {
+			return;
+		}
+
+		DefaultedList<ItemStack> sorted = sortNestedStacks(resolved.stacks(), SortMode.fromIndex(payload.mode()), payload.ascending());
+		sorted = writeNestedContainer(storage, resolved, sorted);
+		handler.sendContentUpdates();
+		sendNestedSync(player, resolved.path(), sorted);
+		warnSlowOperation("sort", resolved.path(), start);
+	}
+
+	private static void warnSlowOperation(String operation, List<Integer> path, long startNanos) {
+		long elapsed = System.nanoTime() - startNanos;
+		if (elapsed >= SLOW_OPERATION_WARNING_NANOS) {
+			LOGGER.warn("Slow nested chest {}: {} ms at depth {}", operation, elapsed / 1_000_000L, path.size());
+		}
+	}
+
+	private static DefaultedList<ItemStack> sortNestedStacks(DefaultedList<ItemStack> stacks, SortMode mode, boolean ascending) {
+		DefaultedList<ItemStack> sorted = DefaultedList.ofSize(stacks.size(), ItemStack.EMPTY);
+		List<SortableStack> movable = new ArrayList<>();
+		for (int slot = 0; slot < stacks.size(); slot++) {
+			ItemStack stack = stacks.get(slot);
+			if (stack.isEmpty()) {
+				continue;
+			}
+			if (isSortLockedStack(stack)) {
+				sorted.set(slot, stack.copy());
+			} else {
+				movable.add(new SortableStack(stack.copy(), slot));
+			}
+		}
+
+		movable.sort(sortComparator(mode, ascending));
+		int movableIndex = 0;
+		for (int slot = 0; slot < sorted.size() && movableIndex < movable.size(); slot++) {
+			if (!sorted.get(slot).isEmpty()) {
+				continue;
+			}
+			sorted.set(slot, movable.get(movableIndex).stack());
+			movableIndex++;
+		}
+		return sorted;
+	}
+
+	private static Comparator<SortableStack> sortComparator(SortMode mode, boolean ascending) {
+		Comparator<SortableStack> nameComparator = Comparator
+				.comparing((SortableStack sortable) -> sortable.stack().getName().getString(), String.CASE_INSENSITIVE_ORDER)
+				.thenComparing(sortable -> Registries.ITEM.getId(sortable.stack().getItem()).toString());
+		Comparator<SortableStack> comparator = switch (mode) {
+			case COUNT -> Comparator
+					.comparingInt((SortableStack sortable) -> sortable.stack().getCount())
+					.thenComparing(nameComparator);
+			case CATEGORY -> Comparator
+					.comparingInt((SortableStack sortable) -> itemCategory(sortable.stack()))
+					.thenComparing(nameComparator);
+			case NAME -> nameComparator;
+		};
+		if (!ascending) {
+			comparator = comparator.reversed();
+		}
+		return comparator.thenComparingInt(SortableStack::originalSlot);
+	}
+
+	private static boolean isSortLockedStack(ItemStack stack) {
+		return isChestItem(stack) || stack.isOf(Items.HOPPER);
+	}
+
+	private static int itemCategory(ItemStack stack) {
+		if (stack.isIn(ItemTags.PICKAXES) || stack.isIn(ItemTags.AXES) || stack.isIn(ItemTags.SWORDS) || stack.isDamageable()) {
+			return 10;
+		}
+		if (stack.contains(DataComponentTypes.FOOD)) {
+			return 20;
+		}
+		if (stack.contains(DataComponentTypes.POTION_CONTENTS)) {
+			return 30;
+		}
+		if (stack.contains(DataComponentTypes.STORED_ENCHANTMENTS) || stack.contains(DataComponentTypes.ENCHANTMENTS)) {
+			return 40;
+		}
+		String id = Registries.ITEM.getId(stack.getItem()).toString();
+		if (id.contains("_block") || id.contains("planks") || id.contains("stone") || id.contains("brick") || id.contains("glass")) {
+			return 0;
+		}
+		if (id.contains("ore") || id.contains("ingot") || id.contains("gem") || id.contains("dust")) {
+			return 50;
+		}
+		return 100;
 	}
 
 	public static boolean isChestItem(ItemStack stack) {
 		return stack.isOf(Items.CHEST) || stack.isOf(Items.TRAPPED_CHEST);
 	}
 
-	public static DefaultedList<ItemStack> getNestedStacks(ItemStack stack) {
-		DefaultedList<ItemStack> stacks = DefaultedList.ofSize(NESTED_CHEST_SIZE, ItemStack.EMPTY);
-		ContainerComponent component = stack.getOrDefault(DataComponentTypes.CONTAINER, ContainerComponent.DEFAULT);
-		component.copyTo(stacks);
-		return stacks;
+	private static DefaultedList<ItemStack> getNestedStacks(NestedChestStorage storage, ItemStack stack) {
+		return storage.getStacks(stack);
 	}
 
-	public static void setNestedStacks(ItemStack stack, DefaultedList<ItemStack> stacks) {
-		stack.set(DataComponentTypes.CONTAINER, ContainerComponent.fromStacks(stacks));
+	private static void setNestedStacks(NestedChestStorage storage, ItemStack stack, DefaultedList<ItemStack> stacks) {
+		storage.setStacks(stack, stacks);
 	}
 
 	public static ItemStack sanitizeDroppedChestItem(ItemStack stack) {
 		if (!isChestItem(stack)) {
 			return stack;
 		}
-		return new ItemStack(stack.getItem(), stack.getCount());
+		ItemStack sanitized = new ItemStack(stack.getItem(), stack.getCount());
+		return sanitized;
 	}
 
 	public static void sanitizeChestDrops(Inventory inventory) {
@@ -148,14 +319,114 @@ public class NestedChestMod implements ModInitializer {
 		}
 	}
 
-	private static void runVanillaNestedClick(ResolvedNestedContainer resolved, ScreenHandler realHandler, ServerPlayerEntity player, int slot, int button, SlotActionType actionType) {
+	public static void sanitizeChestDrops(World world, BlockPos pos, Inventory inventory) {
+		if (world.isClient() || world.getServer() == null) {
+			sanitizeChestDrops(inventory);
+			return;
+		}
+
+		NestedChestStorage storage = NestedChestStorage.get(world.getServer());
+		Set<String> visitedStorageIds = new HashSet<>();
+		for (int slot = 0; slot < inventory.size(); slot++) {
+			ItemStack stack = inventory.getStack(slot);
+			if (stack.isEmpty()) {
+				continue;
+			}
+			if (isChestItem(stack)) {
+				dropStoredNestedContents(world, pos, storage, stack, visitedStorageIds);
+			}
+			ItemStack sanitized = sanitizeDroppedChestItem(stack);
+			if (sanitized != stack) {
+				inventory.setStack(slot, sanitized);
+			}
+		}
+	}
+
+	private static void dropStoredNestedContents(World world, BlockPos pos, NestedChestStorage storage, ItemStack rootStack, Set<String> visitedStorageIds) {
+		List<ItemStack> pendingChests = new ArrayList<>();
+		pendingChests.add(rootStack.copy());
+
+		while (!pendingChests.isEmpty()) {
+			ItemStack chestStack = pendingChests.removeLast();
+			DefaultedList<ItemStack> storedStacks = loadExistingNestedStacks(storage, chestStack, visitedStorageIds);
+			if (storedStacks == null) {
+				continue;
+			}
+
+			for (ItemStack childStack : storedStacks) {
+				if (childStack.isEmpty()) {
+					continue;
+				}
+				if (isChestItem(childStack)) {
+					scatterNestedDrop(world, pos, sanitizeDroppedChestItem(childStack));
+					if (hasStoredNestedContents(storage, childStack)) {
+						pendingChests.add(childStack.copy());
+					}
+				} else {
+					scatterNestedDrop(world, pos, childStack.copy());
+				}
+			}
+		}
+	}
+
+	private static DefaultedList<ItemStack> loadExistingNestedStacks(NestedChestStorage storage, ItemStack stack, Set<String> visitedStorageIds) {
+		String storageId = storage.getStorageId(stack);
+		if (!storageId.isBlank()) {
+			if (!visitedStorageIds.add(storageId)) {
+				return null;
+			}
+			return getNestedStacks(storage, stack);
+		}
+
+		ContainerComponent legacyContainer = stack.get(DataComponentTypes.CONTAINER);
+		if (legacyContainer == null || legacyContainer == ContainerComponent.DEFAULT) {
+			return null;
+		}
+
+		DefaultedList<ItemStack> stacks = DefaultedList.ofSize(NESTED_CHEST_SIZE, ItemStack.EMPTY);
+		legacyContainer.copyTo(stacks);
+		return stacks;
+	}
+
+	private static boolean hasStoredNestedContents(NestedChestStorage storage, ItemStack stack) {
+		if (!isChestItem(stack)) {
+			return false;
+		}
+		if (!storage.getStorageId(stack).isBlank()) {
+			return true;
+		}
+		ContainerComponent legacyContainer = stack.get(DataComponentTypes.CONTAINER);
+		return legacyContainer != null && legacyContainer != ContainerComponent.DEFAULT;
+	}
+
+	private static void scatterNestedDrop(World world, BlockPos pos, ItemStack stack) {
+		if (stack.isEmpty()) {
+			return;
+		}
+		ItemScatterer.spawn(world, pos.getX() + 0.5D, pos.getY() + 0.5D, pos.getZ() + 0.5D, stack);
+	}
+
+	private static DefaultedList<ItemStack> runVanillaNestedClick(NestedChestStorage storage, ResolvedNestedContainer resolved, ScreenHandler realHandler, ServerPlayerEntity player, int slot, int button, SlotActionType actionType) {
 		SimpleInventory inventory = copyToInventory(resolved);
 		GenericContainerScreenHandler nestedHandler = createNestedHandler(resolved, realHandler, player, inventory);
 		nestedHandler.setCursorStack(realHandler.getCursorStack().copy());
 		nestedHandler.onSlotClick(slot, button, actionType, player);
 		realHandler.setCursorStack(nestedHandler.getCursorStack().copy());
 
-		writeNestedContainer(resolved, copyFromInventory(inventory, resolved.size()));
+		DefaultedList<ItemStack> updatedStacks = copyFromInventory(inventory, resolved.size());
+		updatedStacks = writeNestedContainer(storage, resolved, updatedStacks);
+		return updatedStacks;
+	}
+
+	private static int translateNestedClickSlot(ResolvedNestedContainer resolved, List<Integer> originalPath, int slot) {
+		if (slot < 0 || resolved.secondary() == null || resolved.path().isEmpty() || originalPath.isEmpty()) {
+			return slot;
+		}
+		int pathOffset = Math.floorMod(originalPath.getLast(), NESTED_CHEST_SIZE) - Math.floorMod(resolved.path().getLast(), NESTED_CHEST_SIZE);
+		if (pathOffset <= 0 || pathOffset > 1) {
+			return slot;
+		}
+		return slot + pathOffset * NESTED_CHEST_SIZE;
 	}
 
 	private static void runVanillaNestedQuickCraft(ResolvedNestedContainer resolved, ScreenHandler realHandler, ServerPlayerEntity player, int slot, int packedButton, int containerSlots) {
@@ -178,10 +449,12 @@ public class NestedChestMod implements ModInitializer {
 
 		if (stage == 2) {
 			realHandler.setCursorStack(session.handler().getCursorStack().copy());
-			writeNestedContainer(session.resolved(), copyFromInventory(session.inventory(), session.resolved().size()));
+			NestedChestStorage storage = NestedChestStorage.get(player.server);
+			DefaultedList<ItemStack> updatedStacks = copyFromInventory(session.inventory(), session.resolved().size());
+			updatedStacks = writeNestedContainer(storage, session.resolved(), updatedStacks);
 			QUICK_CRAFT_SESSIONS.remove(playerId);
 			realHandler.sendContentUpdates();
-			syncPathAndAncestors(player, realHandler, containerSlots, session.resolved().path());
+			sendNestedSync(player, session.resolved().path(), updatedStacks);
 		}
 	}
 
@@ -210,108 +483,151 @@ public class NestedChestMod implements ModInitializer {
 		return rows == 6 ? ScreenHandlerType.GENERIC_9X6 : ScreenHandlerType.GENERIC_9X3;
 	}
 
-	private static ResolvedChest resolveChest(ScreenHandler handler, int containerSlots, List<Integer> path) {
+	private static ResolvedChest resolveChest(NestedChestStorage storage, ScreenHandler handler, int containerSlots, List<Integer> path) {
 		if (path.isEmpty()) {
 			return null;
 		}
 
-		int rootSlotIndex = path.getFirst();
-		if (rootSlotIndex < 0 || rootSlotIndex >= containerSlots || rootSlotIndex >= handler.slots.size()) {
-			return null;
-		}
-
-		Slot rootSlot = handler.getSlot(rootSlotIndex);
-		ItemStack current = rootSlot.getStack();
-		if (!canOpenNestedWindow(current)) {
-			return null;
-		}
-
-		ResolvedChest resolved = new ResolvedChest(rootSlot, current, List.of());
-		for (int depth = 1; depth < path.size(); depth++) {
-			int nestedSlot = path.get(depth);
-			ResolvedChest adjacent = resolveAdjacentChest(handler, containerSlots, List.copyOf(path.subList(0, depth)));
-			int parentSize = adjacent == null ? NESTED_CHEST_SIZE : DOUBLE_NESTED_CHEST_SIZE;
-			if (nestedSlot < 0 || nestedSlot >= parentSize) {
+		ResolvedContainer container = rootContainer(handler, containerSlots);
+		ResolvedChest resolved = null;
+		for (int depth = 0; depth < path.size(); depth++) {
+			int slot = path.get(depth);
+			resolved = resolveSlot(storage, handler, containerSlots, container, slot);
+			if (resolved == null) {
 				return null;
 			}
-
-			ResolvedChest parent = nestedSlot < NESTED_CHEST_SIZE ? resolved : adjacent;
-			if (parent == null) {
-				return null;
+			if (depth < path.size() - 1) {
+				container = containerForResolvedChest(storage, handler, containerSlots, container, slot, resolved);
+				if (container == null) {
+					return null;
+				}
 			}
-			int actualSlot = nestedSlot % NESTED_CHEST_SIZE;
-			DefaultedList<ItemStack> parentStacks = getNestedStacks(parent.stack());
-			current = parentStacks.get(actualSlot);
-			if (!canOpenNestedWindow(current)) {
-				return null;
-			}
-
-			List<ResolvedFrame> frames = new ArrayList<>(parent.frames());
-			frames.add(new ResolvedFrame(parent.stack(), parentStacks, actualSlot));
-			resolved = new ResolvedChest(parent.rootSlot(), current, List.copyOf(frames));
 		}
 
 		return resolved;
 	}
 
-	private static ResolvedNestedContainer resolveNestedContainer(ScreenHandler handler, int containerSlots, List<Integer> path) {
-		List<Integer> normalizedPath = normalizePathForServer(handler, containerSlots, path);
-		ResolvedChest primary = resolveChest(handler, containerSlots, normalizedPath);
+	private static ResolvedNestedContainer resolveNestedContainer(NestedChestStorage storage, ScreenHandler handler, int containerSlots, List<Integer> path, boolean persistResolvedIds) {
+		ResolvedContainer container = rootContainer(handler, containerSlots);
+		List<Integer> normalizedPath = new ArrayList<>(path);
+		ResolvedChest primary = null;
+
+		for (int depth = 0; depth < normalizedPath.size(); depth++) {
+			int slot = normalizedPath.get(depth);
+			int pairStart = getNestedChestPairStart(container.stacks(), slot);
+			if (pairStart >= 0 && pairStart < slot) {
+				int slotOffset = slot - pairStart;
+				slot = pairStart;
+				normalizedPath.set(depth, pairStart);
+				if (depth + 1 < normalizedPath.size()) {
+					normalizedPath.set(depth + 1, normalizedPath.get(depth + 1) + slotOffset * NESTED_CHEST_SIZE);
+				}
+			}
+			if (depth == normalizedPath.size() - 1) {
+				if (pairStart >= 0) {
+					slot = pairStart;
+					normalizedPath.set(depth, pairStart);
+				}
+			}
+
+			primary = resolveSlot(storage, handler, containerSlots, container, slot);
+			if (primary == null) {
+				return null;
+			}
+			if (depth < normalizedPath.size() - 1) {
+				container = containerForResolvedChest(storage, handler, containerSlots, container, slot, primary);
+				if (container == null) {
+					return null;
+				}
+			}
+		}
+
 		if (primary == null) {
 			return null;
 		}
 
-		ResolvedChest secondary = resolveAdjacentChest(handler, containerSlots, normalizedPath);
+		ResolvedContainer resolvedContainer = containerForResolvedChest(storage, handler, containerSlots, container, normalizedPath.getLast(), primary);
+		if (resolvedContainer == null) {
+			return null;
+		}
+		ResolvedChest secondary = resolvedContainer.secondary();
+		if (secondary != null && detachDuplicateSecondaryStorageId(storage, primary, secondary)) {
+			resolvedContainer = containerForResolvedChest(storage, handler, containerSlots, container, normalizedPath.getLast(), primary);
+			secondary = resolvedContainer.secondary();
+		}
+		if (persistResolvedIds) {
+			if (secondary != null) {
+				writeResolvedChestPair(storage, primary, secondary);
+			} else {
+				writeResolvedChest(storage, primary);
+			}
+		}
+		return new ResolvedNestedContainer(List.copyOf(normalizedPath), primary, secondary, resolvedContainer.stacks());
+	}
+
+	private static ResolvedContainer rootContainer(ScreenHandler handler, int containerSlots) {
+		DefaultedList<ItemStack> stacks = DefaultedList.ofSize(containerSlots, ItemStack.EMPTY);
+		for (int i = 0; i < stacks.size() && i < handler.slots.size(); i++) {
+			stacks.set(i, handler.getSlot(i).getStack());
+		}
+		return new ResolvedContainer(stacks, null, null);
+	}
+
+	private static ResolvedChest resolveSlot(NestedChestStorage storage, ScreenHandler handler, int containerSlots, ResolvedContainer container, int slot) {
+		if (slot < 0 || slot >= container.stacks().size()) {
+			return null;
+		}
+
+		if (container.primary() == null) {
+			if (slot >= containerSlots || slot >= handler.slots.size()) {
+				return null;
+			}
+			Slot rootSlot = handler.getSlot(slot);
+			ItemStack stack = rootSlot.getStack();
+			return canOpenNestedWindow(stack) ? new ResolvedChest(rootSlot, stack, List.of()) : null;
+		}
+
+		ResolvedChest parent = slot < NESTED_CHEST_SIZE ? container.primary() : container.secondary();
+		if (parent == null) {
+			return null;
+		}
+
+		int actualSlot = slot % NESTED_CHEST_SIZE;
+		DefaultedList<ItemStack> parentStacks = getNestedStacks(storage, parent.stack());
+		ItemStack stack = parentStacks.get(actualSlot);
+		if (!canOpenNestedWindow(stack)) {
+			return null;
+		}
+
+		List<ResolvedFrame> frames = new ArrayList<>(parent.frames());
+		frames.add(new ResolvedFrame(parent.stack(), parentStacks, actualSlot, stack.copy()));
+		return new ResolvedChest(parent.rootSlot(), stack, List.copyOf(frames));
+	}
+
+	private static ResolvedContainer containerForResolvedChest(NestedChestStorage storage, ScreenHandler handler, int containerSlots, ResolvedContainer parentContainer, int slot, ResolvedChest primary) {
+		ResolvedChest secondary = null;
+		int secondarySlot = getNestedChestPairSecondarySlot(parentContainer.stacks(), slot);
+		if (secondarySlot >= 0) {
+			secondary = resolveSlot(storage, handler, containerSlots, parentContainer, secondarySlot);
+		}
+
 		int size = secondary == null ? NESTED_CHEST_SIZE : DOUBLE_NESTED_CHEST_SIZE;
 		DefaultedList<ItemStack> stacks = DefaultedList.ofSize(size, ItemStack.EMPTY);
-		copyInto(stacks, 0, getNestedStacks(primary.stack()));
+		copyInto(stacks, 0, getNestedStacks(storage, primary.stack()));
 		if (secondary != null) {
-			copyInto(stacks, NESTED_CHEST_SIZE, getNestedStacks(secondary.stack()));
+			copyInto(stacks, NESTED_CHEST_SIZE, getNestedStacks(storage, secondary.stack()));
 		}
-		return new ResolvedNestedContainer(normalizedPath, primary, secondary, stacks);
+		return new ResolvedContainer(stacks, primary, secondary);
 	}
 
-	private static List<Integer> normalizePathForServer(ScreenHandler handler, int containerSlots, List<Integer> path) {
-		if (path.isEmpty()) {
-			return path;
+	private static boolean detachDuplicateSecondaryStorageId(NestedChestStorage storage, ResolvedChest primary, ResolvedChest secondary) {
+		String primaryId = storage.getStorageId(primary.stack());
+		if (primaryId.isBlank() || !primaryId.equals(storage.getStorageId(secondary.stack()))) {
+			return false;
 		}
-		int lastSlot = path.getLast();
-		DefaultedList<ItemStack> parentStacks = stacksForParentPath(handler, containerSlots, List.copyOf(path.subList(0, path.size() - 1)));
-		int pairStart = getNestedChestPairStart(parentStacks, lastSlot);
-		if (pairStart < 0 || pairStart == lastSlot) {
-			return path;
-		}
-		List<Integer> normalizedPath = new ArrayList<>(path);
-		normalizedPath.set(normalizedPath.size() - 1, pairStart);
-		return List.copyOf(normalizedPath);
-	}
-
-	private static ResolvedChest resolveAdjacentChest(ScreenHandler handler, int containerSlots, List<Integer> leftPath) {
-		if (leftPath.isEmpty()) {
-			return null;
-		}
-		DefaultedList<ItemStack> parentStacks = stacksForParentPath(handler, containerSlots, List.copyOf(leftPath.subList(0, leftPath.size() - 1)));
-		int lastSlot = leftPath.getLast();
-		int secondarySlot = getNestedChestPairSecondarySlot(parentStacks, lastSlot);
-		if (secondarySlot < 0) {
-			return null;
-		}
-		List<Integer> rightPath = new ArrayList<>(leftPath);
-		rightPath.set(rightPath.size() - 1, secondarySlot);
-		return resolveChest(handler, containerSlots, rightPath);
-	}
-
-	private static DefaultedList<ItemStack> stacksForParentPath(ScreenHandler handler, int containerSlots, List<Integer> parentPath) {
-		if (parentPath.isEmpty()) {
-			DefaultedList<ItemStack> stacks = DefaultedList.ofSize(containerSlots, ItemStack.EMPTY);
-			for (int i = 0; i < stacks.size() && i < handler.slots.size(); i++) {
-				stacks.set(i, handler.getSlot(i).getStack());
-			}
-			return stacks;
-		}
-
-		ResolvedNestedContainer parent = resolveNestedContainer(handler, containerSlots, parentPath);
-		return parent == null ? DefaultedList.ofSize(0, ItemStack.EMPTY) : parent.stacks();
+		storage.removeStorageId(secondary.stack());
+		writeResolvedChestPair(storage, primary, secondary);
+		return true;
 	}
 
 	private static void copyInto(DefaultedList<ItemStack> target, int offset, DefaultedList<ItemStack> source) {
@@ -320,29 +636,47 @@ public class NestedChestMod implements ModInitializer {
 		}
 	}
 
-	private static void writeNestedContainer(ResolvedNestedContainer resolved, DefaultedList<ItemStack> stacks) {
+	private static DefaultedList<ItemStack> writeNestedContainer(NestedChestStorage storage, ResolvedNestedContainer resolved, DefaultedList<ItemStack> stacks) {
+		DefaultedList<ItemStack> sanitizedStacks = sanitizeDuplicateNestedChestIds(storage, stacks);
 		DefaultedList<ItemStack> primaryStacks = DefaultedList.ofSize(NESTED_CHEST_SIZE, ItemStack.EMPTY);
 		for (int i = 0; i < NESTED_CHEST_SIZE; i++) {
-			primaryStacks.set(i, stacks.get(i).copy());
+			primaryStacks.set(i, sanitizedStacks.get(i).copy());
 		}
-		setNestedStacks(resolved.primary().stack(), primaryStacks);
+		setNestedStacks(storage, resolved.primary().stack(), primaryStacks);
 
 		if (resolved.secondary() != null) {
 			DefaultedList<ItemStack> secondaryStacks = DefaultedList.ofSize(NESTED_CHEST_SIZE, ItemStack.EMPTY);
 			for (int i = 0; i < NESTED_CHEST_SIZE; i++) {
-				secondaryStacks.set(i, stacks.get(NESTED_CHEST_SIZE + i).copy());
+				secondaryStacks.set(i, sanitizedStacks.get(NESTED_CHEST_SIZE + i).copy());
 			}
-			setNestedStacks(resolved.secondary().stack(), secondaryStacks);
-			writeResolvedChestPair(resolved.primary(), resolved.secondary());
+			setNestedStacks(storage, resolved.secondary().stack(), secondaryStacks);
+			writeResolvedChestPair(storage, resolved.primary(), resolved.secondary());
 		} else {
-			writeResolvedChest(resolved.primary());
+			writeResolvedChest(storage, resolved.primary());
 		}
+		return sanitizedStacks;
 	}
 
-	private static void writeResolvedChestPair(ResolvedChest primary, ResolvedChest secondary) {
+	private static DefaultedList<ItemStack> sanitizeDuplicateNestedChestIds(NestedChestStorage storage, DefaultedList<ItemStack> stacks) {
+		DefaultedList<ItemStack> sanitized = DefaultedList.ofSize(stacks.size(), ItemStack.EMPTY);
+		Set<String> seenIds = new HashSet<>();
+		for (int slot = 0; slot < stacks.size(); slot++) {
+			ItemStack stack = stacks.get(slot).copy();
+			if (isChestItem(stack)) {
+				String id = storage.getStorageId(stack);
+				if (!id.isBlank() && !seenIds.add(id)) {
+					storage.removeStorageId(stack);
+				}
+			}
+			sanitized.set(slot, stack);
+		}
+		return sanitized;
+	}
+
+	private static void writeResolvedChestPair(NestedChestStorage storage, ResolvedChest primary, ResolvedChest secondary) {
 		if (!canWriteAsSiblingPair(primary, secondary)) {
-			writeResolvedChest(primary);
-			writeResolvedChest(secondary);
+			writeResolvedChest(storage, primary);
+			writeResolvedChest(storage, secondary);
 			return;
 		}
 
@@ -357,19 +691,13 @@ public class NestedChestMod implements ModInitializer {
 		int lastFrameIndex = primary.frames().size() - 1;
 		ResolvedFrame lastPrimaryFrame = primary.frames().get(lastFrameIndex);
 		ResolvedFrame lastSecondaryFrame = secondary.frames().get(lastFrameIndex);
-		lastPrimaryFrame.stacks().set(lastPrimaryFrame.childSlot(), primary.stack());
-		lastPrimaryFrame.stacks().set(lastSecondaryFrame.childSlot(), secondary.stack());
-
-		ItemStack child = lastPrimaryFrame.stack();
-		setNestedStacks(child, lastPrimaryFrame.stacks());
-		for (int i = lastFrameIndex - 1; i >= 0; i--) {
-			ResolvedFrame frame = primary.frames().get(i);
-			frame.stacks().set(frame.childSlot(), child);
-			setNestedStacks(frame.stack(), frame.stacks());
-			child = frame.stack();
+		if (!stacksEqual(lastPrimaryFrame.originalChild(), primary.stack()) || !stacksEqual(lastSecondaryFrame.originalChild(), secondary.stack())) {
+			lastPrimaryFrame.stacks().set(lastPrimaryFrame.childSlot(), primary.stack());
+			lastPrimaryFrame.stacks().set(lastSecondaryFrame.childSlot(), secondary.stack());
+			setNestedStacks(storage, lastPrimaryFrame.stack(), lastPrimaryFrame.stacks());
 		}
-		primary.rootSlot().setStack(child);
-		primary.rootSlot().markDirty();
+
+		writeChangedAncestorChain(storage, primary.rootSlot(), primary.frames(), lastPrimaryFrame.stack(), lastFrameIndex - 1);
 	}
 
 	private static boolean canWriteAsSiblingPair(ResolvedChest primary, ResolvedChest secondary) {
@@ -390,26 +718,75 @@ public class NestedChestMod implements ModInitializer {
 		return true;
 	}
 
-	private static void writeResolvedChest(ResolvedChest resolved) {
-		ItemStack child = resolved.stack();
-		for (int i = resolved.frames().size() - 1; i >= 0; i--) {
-			ResolvedFrame frame = resolved.frames().get(i);
-			frame.stacks().set(frame.childSlot(), child);
-			setNestedStacks(frame.stack(), frame.stacks());
-			child = frame.stack();
-		}
-		resolved.rootSlot().setStack(child);
-		resolved.rootSlot().markDirty();
+	private static void writeResolvedChest(NestedChestStorage storage, ResolvedChest resolved) {
+		writeChangedAncestorChain(storage, resolved.rootSlot(), resolved.frames(), resolved.stack(), resolved.frames().size() - 1);
 	}
 
-	private static void syncPathAndAncestors(ServerPlayerEntity player, ScreenHandler handler, int containerSlots, List<Integer> path) {
+	private static void writeChangedAncestorChain(NestedChestStorage storage, Slot rootSlot, List<ResolvedFrame> frames, ItemStack child, int startFrameIndex) {
+		for (int i = startFrameIndex; i >= 0; i--) {
+			ResolvedFrame frame = frames.get(i);
+			if (!stacksEqual(frame.originalChild(), child)) {
+				frame.stacks().set(frame.childSlot(), child);
+				setNestedStacks(storage, frame.stack(), frame.stacks());
+			}
+			child = frame.stack();
+		}
+		rootSlot.setStack(child);
+		rootSlot.markDirty();
+	}
+
+	private static boolean stacksEqual(ItemStack left, ItemStack right) {
+		if (left.isEmpty() && right.isEmpty()) {
+			return true;
+		}
+		return left.getCount() == right.getCount() && ItemStack.areItemsAndComponentsEqual(left, right);
+	}
+
+	private static void syncPathAndAncestors(NestedChestStorage storage, ServerPlayerEntity player, ScreenHandler handler, int containerSlots, List<Integer> path) {
 		for (int size = 1; size <= path.size(); size++) {
 			List<Integer> subPath = List.copyOf(path.subList(0, size));
-			ResolvedNestedContainer resolved = resolveNestedContainer(handler, containerSlots, subPath);
-			if (resolved != null) {
-				ServerPlayNetworking.send(player, new NestedChestSyncPayload(resolved.path(), resolved.stacks()));
-			}
+			syncNestedPath(storage, player, handler, containerSlots, subPath);
 		}
+	}
+
+	private static void syncNestedPath(NestedChestStorage storage, ServerPlayerEntity player, ScreenHandler handler, int containerSlots, List<Integer> path) {
+		ResolvedNestedContainer resolved = resolveNestedContainer(storage, handler, containerSlots, path, false);
+		if (resolved != null) {
+			sendNestedSync(player, resolved);
+		}
+	}
+
+	private static void sendNestedSync(ServerPlayerEntity player, ResolvedNestedContainer resolved) {
+		sendNestedSync(player, resolved.path(), resolved.stacks());
+	}
+
+	private static void sendNestedSync(ServerPlayerEntity player, List<Integer> path, DefaultedList<ItemStack> stacks) {
+		ServerPlayNetworking.send(player, new NestedChestSyncPayload(path, displayStacksForSync(stacks)));
+	}
+
+	private static DefaultedList<ItemStack> displayStacksForSync(DefaultedList<ItemStack> stacks) {
+		DefaultedList<ItemStack> display = DefaultedList.ofSize(stacks.size(), ItemStack.EMPTY);
+		for (int slot = 0; slot < stacks.size(); slot++) {
+			display.set(slot, displayStackForSync(stacks.get(slot)));
+		}
+		return display;
+	}
+
+	private static ItemStack displayStackForSync(ItemStack stack) {
+		if (stack.isEmpty()) {
+			return ItemStack.EMPTY;
+		}
+
+		ItemStack display = stack.copy();
+		display.remove(DataComponentTypes.WRITABLE_BOOK_CONTENT);
+		display.remove(DataComponentTypes.WRITTEN_BOOK_CONTENT);
+		display.remove(DataComponentTypes.CONTAINER);
+		display.remove(DataComponentTypes.BUNDLE_CONTENTS);
+		display.remove(DataComponentTypes.BLOCK_ENTITY_DATA);
+		display.remove(DataComponentTypes.ENTITY_DATA);
+		display.remove(DataComponentTypes.BUCKET_ENTITY_DATA);
+		display.remove(DataComponentTypes.BEES);
+		return display;
 	}
 
 	public static boolean canOpenNestedWindow(ItemStack stack) {
@@ -459,6 +836,11 @@ public class NestedChestMod implements ModInitializer {
 			return stack;
 		}
 
+		World world = HOPPER_TRANSFER_WORLD.get();
+		if (world == null || world.isClient() || world.getServer() == null) {
+			return stack;
+		}
+		NestedChestStorage storage = NestedChestStorage.get(world.getServer());
 		ItemStack remaining = stack;
 		boolean[] handledSlots = new boolean[inventory.size()];
 		for (int slot = 0; slot < inventory.size() && !remaining.isEmpty(); slot++) {
@@ -489,18 +871,26 @@ public class NestedChestMod implements ModInitializer {
 
 			int size = secondarySlot >= 0 ? DOUBLE_NESTED_CHEST_SIZE : NESTED_CHEST_SIZE;
 			DefaultedList<ItemStack> nestedStacks = DefaultedList.ofSize(size, ItemStack.EMPTY);
-			copyInto(nestedStacks, 0, getNestedStacks(primary));
+			copyInto(nestedStacks, 0, getNestedStacks(storage, primary));
 			if (secondarySlot >= 0) {
-				copyInto(nestedStacks, NESTED_CHEST_SIZE, getNestedStacks(inventory.getStack(secondarySlot)));
+				copyInto(nestedStacks, NESTED_CHEST_SIZE, getNestedStacks(storage, inventory.getStack(secondarySlot)));
 			}
 
 			remaining = insertIntoStacks(nestedStacks, remaining);
 			if (remaining.getCount() != stack.getCount()) {
-				writeBoundNestedStacks(inventory, primarySlot, secondarySlot, nestedStacks);
+				writeBoundNestedStacks(storage, inventory, primarySlot, secondarySlot, nestedStacks);
 				inventory.markDirty();
 			}
 		}
 		return remaining;
+	}
+
+	public static void setHopperTransferWorld(World world) {
+		HOPPER_TRANSFER_WORLD.set(world);
+	}
+
+	public static void clearHopperTransferWorld() {
+		HOPPER_TRANSFER_WORLD.remove();
 	}
 
 	private static int normalizeBoundChestSlot(Inventory inventory, int slot) {
@@ -521,13 +911,13 @@ public class NestedChestMod implements ModInitializer {
 		return stacks;
 	}
 
-	private static void writeBoundNestedStacks(Inventory inventory, int primarySlot, int secondarySlot, DefaultedList<ItemStack> stacks) {
+	private static void writeBoundNestedStacks(NestedChestStorage storage, Inventory inventory, int primarySlot, int secondarySlot, DefaultedList<ItemStack> stacks) {
 		ItemStack primary = inventory.getStack(primarySlot);
 		DefaultedList<ItemStack> primaryStacks = DefaultedList.ofSize(NESTED_CHEST_SIZE, ItemStack.EMPTY);
 		for (int i = 0; i < NESTED_CHEST_SIZE; i++) {
 			primaryStacks.set(i, stacks.get(i).copy());
 		}
-		setNestedStacks(primary, primaryStacks);
+		setNestedStacks(storage, primary, primaryStacks);
 		inventory.setStack(primarySlot, primary);
 
 		if (secondarySlot >= 0) {
@@ -536,7 +926,7 @@ public class NestedChestMod implements ModInitializer {
 			for (int i = 0; i < NESTED_CHEST_SIZE; i++) {
 				secondaryStacks.set(i, stacks.get(NESTED_CHEST_SIZE + i).copy());
 			}
-			setNestedStacks(secondary, secondaryStacks);
+			setNestedStacks(storage, secondary, secondaryStacks);
 			inventory.setStack(secondarySlot, secondary);
 		}
 	}
@@ -569,7 +959,10 @@ public class NestedChestMod implements ModInitializer {
 	private record ResolvedChest(Slot rootSlot, ItemStack stack, List<ResolvedFrame> frames) {
 	}
 
-	private record ResolvedFrame(ItemStack stack, DefaultedList<ItemStack> stacks, int childSlot) {
+	private record ResolvedFrame(ItemStack stack, DefaultedList<ItemStack> stacks, int childSlot, ItemStack originalChild) {
+	}
+
+	private record ResolvedContainer(DefaultedList<ItemStack> stacks, ResolvedChest primary, ResolvedChest secondary) {
 	}
 
 	private record ResolvedNestedContainer(List<Integer> path, ResolvedChest primary, ResolvedChest secondary, DefaultedList<ItemStack> stacks) {
@@ -579,5 +972,20 @@ public class NestedChestMod implements ModInitializer {
 	}
 
 	private record QuickCraftSession(List<Integer> path, ResolvedNestedContainer resolved, SimpleInventory inventory, GenericContainerScreenHandler handler) {
+	}
+
+	private record SortableStack(ItemStack stack, int originalSlot) {
+	}
+
+	private enum SortMode {
+		NAME,
+		COUNT,
+		CATEGORY;
+
+		private static SortMode fromIndex(int index) {
+			SortMode[] values = values();
+			int normalized = Math.floorMod(index, values.length);
+			return values[normalized];
+		}
 	}
 }
