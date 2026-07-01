@@ -61,6 +61,7 @@ public final class NestedChestClientConfig {
 	public static LoadedBackground background() {
 		long now = System.currentTimeMillis();
 		if (now - lastImageScanMs >= IMAGE_RESCAN_INTERVAL_MS) {
+			// 背景图支持热替换，但最多每秒扫一次目录，避免每帧访问磁盘。
 			lastImageScanMs = now;
 			refreshBackground(false);
 		}
@@ -130,6 +131,7 @@ public final class NestedChestClientConfig {
 
 			Long failedModifiedTime = failedImages.get(image);
 			if (!force && failedModifiedTime != null && failedModifiedTime == fileTime) {
+				// 同一个坏文件在修改前不反复解析，避免日志刷屏和 UI 卡顿。
 				continue;
 			}
 
@@ -179,6 +181,7 @@ public final class NestedChestClientConfig {
 			throw new IOException("Unable to decode JPEG image");
 		}
 		NativeImage nativeImage = new NativeImage(buffered.getWidth(), buffered.getHeight(), false);
+		// NativeImage 使用 ABGR 写入顺序，JPEG 由 ImageIO 解码后需要手动换通道。
 		for (int y = 0; y < buffered.getHeight(); y++) {
 			for (int x = 0; x < buffered.getWidth(); x++) {
 				int argb = buffered.getRGB(x, y);
@@ -222,6 +225,7 @@ public final class NestedChestClientConfig {
 		try (InputStream input = Files.newInputStream(path)) {
 			read = input.read(header);
 		}
+		// 先看文件签名而不是扩展名，避免把 JPG 当 PNG 交给 NativeImage 造成 Bad PNG Signature。
 		if (read >= 8
 				&& (header[0] & 0xFF) == 0x89
 				&& header[1] == 0x50

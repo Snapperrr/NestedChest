@@ -34,6 +34,7 @@ public abstract class ChestBlockMixin {
 		}
 		BlockEntity blockEntity = world.getBlockEntity(pos);
 		if (blockEntity instanceof Inventory inventory) {
+			// 打破箱子前先清理目录箱掉落物，防止数据库 ID 变成可复制物品。
 			NestedChestMod.sanitizeChestDrops(world, pos, inventory);
 		}
 	}
@@ -43,6 +44,7 @@ public abstract class ChestBlockMixin {
 		VoxelShape shape = cir.getReturnValue();
 		for (Direction direction : Direction.values()) {
 			if (ConnectedChestFinder.isSupportedChest(world.getBlockState(pos.offset(direction)))) {
+				// 轮廓扩展到相邻箱子，玩家选中时能感知它们属于同一组合体。
 				shape = VoxelShapes.union(shape, VoxelShapes.fullCube().offset(direction.getOffsetX(), direction.getOffsetY(), direction.getOffsetZ()));
 			}
 		}
@@ -60,6 +62,7 @@ public abstract class ChestBlockMixin {
 			return;
 		}
 
+		// 多个相邻箱子打开自定义滚动容器；单个箱子仍保留原版行为。
 		serverPlayer.openHandledScreen(new ConnectedChestScreenHandlerFactory(inventory));
 		serverPlayer.incrementStat(Stats.OPEN_CHEST);
 		cir.setReturnValue(ActionResult.CONSUME);

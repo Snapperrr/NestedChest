@@ -35,7 +35,7 @@ public final class NestedChestOverlay {
 	private static final int NAV_BAR_HEIGHT = 22;
 	private static final int PADDING = 7;
 	private static final int GRID_WIDTH = GRID_COLUMNS * SLOT_SIZE;
-	private static final int WINDOW_WIDTH = 232;
+	private static final int WINDOW_WIDTH = GRID_WIDTH + PADDING * 2;
 	private static final int PANEL_RADIUS = 4;
 	private static final int BUTTON_RADIUS = 3;
 	private static final int BACK_BUTTON_SIZE = 16;
@@ -48,16 +48,19 @@ public final class NestedChestOverlay {
 	private static final int RENAME_HEIGHT = 86;
 	private static final int RENAME_BUTTON_WIDTH = 78;
 	private static final int RENAME_BUTTON_HEIGHT = 20;
-	private static final String ROOT_PATH_NAME = "连接箱子";
+	private static final String ROOT_PATH_NAME = "杩炴帴绠卞瓙";
+	// 箱中箱 UI 是叠在原版容器上的浮层，Z 值要压过原版槽位和提示。
 	private static final float OVERLAY_Z = 500.0F;
 	private static final float WINDOW_LAYER_Z = 300.0F;
 	private static final float MAX_WINDOW_Z = 6000.0F;
 	private static final float DETAIL_LAYER_Z = 7500.0F;
 	private static final float CURSOR_LAYER_Z = 9000.0F;
 	private static final List<NestedWindow> WINDOWS = new ArrayList<>();
+	// 路径显示用箱子名字，协议仍用槽位编号；缓存让手写路径和重命名后的导航能对上。
 	private static final Map<List<Integer>, List<String>> PATH_NAME_CACHE = new HashMap<>();
 	private static final Map<List<Integer>, DefaultedList<ItemStack>> PATH_STACK_CACHE = new HashMap<>();
 
+	// 这些状态分别处理拖窗口、弹窗焦点、双击记忆、快速合成拖拽和普通按住拖放。
 	private static NestedWindow draggedWindow;
 	private static RenameDialog renameDialog;
 	private static TextFieldWidget pathField;
@@ -109,6 +112,7 @@ public final class NestedChestOverlay {
 		for (int layer = 0; layer < WINDOWS.size(); layer++) {
 			NestedWindow window = WINDOWS.get(layer);
 			context.getMatrices().push();
+			// 父窗口先画，子窗口后画，保证最深层目录永远在视觉最上面。
 			context.getMatrices().translate(0.0F, 0.0F, windowLayerZ(layer));
 			RenderSystem.disableDepthTest();
 			window.clampToScreen();
@@ -146,6 +150,7 @@ public final class NestedChestOverlay {
 
 		MinecraftClient client = MinecraftClient.getInstance();
 		context.getMatrices().push();
+		// 鼠标指针上拿着的物品最后渲染，避免被父级或子级窗口盖住。
 		context.getMatrices().translate(0.0F, 0.0F, CURSOR_LAYER_Z);
 		RenderSystem.disableDepthTest();
 		context.drawItem(cursorStack, mouseX - 8, mouseY - 8);
@@ -176,6 +181,8 @@ public final class NestedChestOverlay {
 	}
 
 	public static boolean mouseClicked(ScreenHandler handler, double mouseX, double mouseY, int button) {
+		// 新点击不继承旧的窗口拖动状态，避免在槽位里轻微拖动时把浮窗拽走。
+		draggedWindow = null;
 		if (renameDialog != null) {
 			return renameDialog.mouseClicked(mouseX, mouseY, button);
 		}
@@ -238,7 +245,7 @@ public final class NestedChestOverlay {
 				return true;
 			}
 
-			if (window.titleContains(mouseX, mouseY)) {
+			if (button == 0 && window.titleContains(mouseX, mouseY)) {
 				draggedWindow = window;
 				quickCraftDrag = null;
 				dragOffsetX = (int) mouseX - window.x;
@@ -249,6 +256,12 @@ public final class NestedChestOverlay {
 			int nestedSlot = window.slotAt(mouseX, mouseY);
 			if (nestedSlot >= 0) {
 				ItemStack stack = window.stacks.get(nestedSlot);
+				if (isDoubleClick(window, nestedSlot, button)) {
+					// 双击要先于快速合成判断，否则拿着物品时会被误认为拖拽分配。
+					sendMouseClick(window, nestedSlot, button);
+					dragPickup = new DragPickup(window, true, nestedSlot, button);
+					return true;
+				}
 				if (beginQuickCraftIfNeeded(handler, window, nestedSlot, button)) {
 					return true;
 				}
@@ -263,7 +276,7 @@ public final class NestedChestOverlay {
 				}
 
 				sendMouseClick(window, nestedSlot, button);
-				dragPickup = new DragPickup(window, true, button);
+				dragPickup = new DragPickup(window, true, nestedSlot, button);
 				return true;
 			}
 
@@ -274,12 +287,18 @@ public final class NestedChestOverlay {
 		Slot playerSlot = getPlayerSlotAt(handler, mouseX, mouseY);
 		if (activeWindow != null && playerSlot != null) {
 			int playerSlotOffset = playerSlot.id - containerSlotCount(handler);
+			// 服务端临时嵌套 Handler 的槽位顺序是：当前箱中箱槽位 + 玩家背包槽位。
 			int nestedPlayerSlot = activeWindow.stacks.size() + playerSlotOffset;
+			if (isDoubleClick(activeWindow, nestedPlayerSlot, button)) {
+				sendMouseClick(activeWindow, nestedPlayerSlot, button);
+				dragPickup = new DragPickup(activeWindow, false, nestedPlayerSlot, button);
+				return true;
+			}
 			if (beginQuickCraftIfNeeded(handler, activeWindow, nestedPlayerSlot, button)) {
 				return true;
 			}
 			sendMouseClick(activeWindow, nestedPlayerSlot, button);
-			dragPickup = new DragPickup(activeWindow, false, button);
+			dragPickup = new DragPickup(activeWindow, false, nestedPlayerSlot, button);
 			return true;
 		}
 
@@ -317,6 +336,10 @@ public final class NestedChestOverlay {
 		if (renameDialog != null) {
 			return true;
 		}
+		if (draggedWindow != null && button == 0) {
+			draggedWindow = null;
+			return true;
+		}
 		if (quickCraftDrag != null && quickCraftDrag.button == button) {
 			if (quickCraftDrag.visitedSlots.isEmpty()) {
 				int slot = slotAtForQuickCraft(quickCraftDrag.window, mouseX, mouseY);
@@ -335,35 +358,37 @@ public final class NestedChestOverlay {
 			MinecraftClient client = MinecraftClient.getInstance();
 			if (client.player != null) {
 				if (dragPickup.startedInNested) {
+					NestedSlotTarget nestedTarget = nestedSlotTargetAt(mouseX, mouseY);
+					if (nestedTarget != null) {
+						// 按下和释放在同一嵌套槽位时不补第二次点击，防止释放阶段抵消普通点击。
+						if (nestedTarget.window != dragPickup.window || nestedTarget.slot != dragPickup.startSlot) {
+							sendClick(nestedTarget.window, nestedTarget.slot, button, SlotActionType.PICKUP);
+						}
+						dragPickup = null;
+						return true;
+					}
 					Slot playerSlot = getPlayerSlotAt(client.player.currentScreenHandler, mouseX, mouseY);
-					if (playerSlot != null) {
+					if (playerSlot != null && !isPointInsideNestedWindow(mouseX, mouseY)) {
 						int playerSlotOffset = playerSlot.id - containerSlotCount(client.player.currentScreenHandler);
 						sendClick(dragPickup.window, dragPickup.window.stacks.size() + playerSlotOffset, button, SlotActionType.PICKUP);
 						dragPickup = null;
 						return true;
 					}
 				} else {
-					NestedWindow topWindow = getTopWindow();
-					if (topWindow != null) {
-						int hoveredSlot = topWindow.slotAt(mouseX, mouseY);
-						if (hoveredSlot >= 0) {
-							sendClick(topWindow, hoveredSlot, button, SlotActionType.PICKUP);
-							dragPickup = null;
-							return true;
-						}
+					NestedSlotTarget nestedTarget = nestedSlotTargetAt(mouseX, mouseY);
+					if (nestedTarget != null) {
+						sendClick(nestedTarget.window, nestedTarget.slot, button, SlotActionType.PICKUP);
+						dragPickup = null;
+						return true;
 					}
 				}
 			}
 			dragPickup = null;
+			return true;
 		}
-		NestedWindow topWindow = getTopWindow();
-		if (topWindow != null && button >= 0 && button <= 1) {
-			int hoveredSlot = topWindow.slotAt(mouseX, mouseY);
-			MinecraftClient client = MinecraftClient.getInstance();
-			if (hoveredSlot >= 0 && client.player != null && !client.player.currentScreenHandler.getCursorStack().isEmpty()) {
-				sendClick(topWindow, hoveredSlot, button, SlotActionType.PICKUP);
-				return true;
-			}
+		if (button >= 0 && button <= 1 && isPointInsideNestedWindow(mouseX, mouseY)) {
+			// 鼠标释放落在浮窗内部时吞掉事件，避免穿透到底层玩家背包。
+			return true;
 		}
 		if (quickCraftDrag != null) {
 			quickCraftDrag = null;
@@ -390,7 +415,7 @@ public final class NestedChestOverlay {
 			}
 			return true;
 		}
-		if (draggedWindow == null) {
+		if (draggedWindow == null || button != 0) {
 			return false;
 		}
 
@@ -473,6 +498,7 @@ public final class NestedChestOverlay {
 		for (int i = WINDOWS.size() - 1; i >= 0; i--) {
 			NestedWindow window = WINDOWS.get(i);
 			if (window.pendingPathMatches(path)) {
+				// 客户端会先开占位窗口，等服务端同步回来后再用真实路径和物品覆盖。
 				window.setPath(path);
 				window.clearPendingPath();
 				window.setSource(view);
@@ -603,7 +629,8 @@ public final class NestedChestOverlay {
 			return;
 		}
 		if (pathField == null) {
-			pathField = new TextFieldWidget(MinecraftClient.getInstance().textRenderer, 0, 0, 1, PATH_FIELD_HEIGHT, Text.literal("路径"));
+			// 路径输入框挂到当前 Screen 的 selectable children，才能拿到键盘焦点。
+			pathField = new TextFieldWidget(MinecraftClient.getInstance().textRenderer, 0, 0, 1, PATH_FIELD_HEIGHT, Text.literal("璺緞"));
 			pathField.setMaxLength(160);
 			((ScreenAccessor) screen).nestedchest$addSelectableChild(pathField);
 		}
@@ -711,6 +738,7 @@ public final class NestedChestOverlay {
 			path.add(slot);
 			DefaultedList<ItemStack> cachedStacks = PATH_STACK_CACHE.get(List.copyOf(path));
 			if (cachedStacks != null) {
+				// 手写路径只能继续解析客户端已经见过的目录；缺失时交给服务端同步补齐。
 				currentStacks = cachedStacks;
 				continue;
 			}
@@ -744,7 +772,7 @@ public final class NestedChestOverlay {
 			return "";
 		}
 		String value = text.getString().trim().replace('\\', '/').replace('/', '_');
-		value = value.replaceFirst("\\s+[xX×]\\s*\\{?\\d+\\}?$", "").trim();
+		value = value.replaceFirst("\\s+[xX脳]\\s*\\{?\\d+\\}?$", "").trim();
 		return value.isBlank() ? ROOT_PATH_NAME : value;
 	}
 
@@ -904,6 +932,7 @@ public final class NestedChestOverlay {
 	}
 
 	private static void sortForAncestorLayering() {
+		// 祖先窗口排在前面、子路径排在后面，渲染和命中检测才会保持子目录在最上层。
 		WINDOWS.sort((left, right) -> {
 			if (isProperDescendant(left.path, right.path)) {
 				return 1;
@@ -996,12 +1025,14 @@ public final class NestedChestOverlay {
 
 		NestedChestClientConfig.BackgroundMode mode = NestedChestClientConfig.backgroundMode();
 		if (mode == NestedChestClientConfig.BackgroundMode.FIT) {
+			// 自适应保留图片比例，剩余区域继续显示原版槽位底色。
 			float scale = Math.min(width / (float) background.width(), height / (float) background.height());
 			drawWidth = Math.max(1, Math.round(background.width() * scale));
 			drawHeight = Math.max(1, Math.round(background.height() * scale));
 			drawX = x + (width - drawWidth) / 2;
 			drawY = y + (height - drawHeight) / 2;
 		} else if (mode == NestedChestClientConfig.BackgroundMode.FILL) {
+			// 填充会裁切图片中心区域，保证储物格背景铺满。
 			float scale = Math.max(width / (float) background.width(), height / (float) background.height());
 			regionWidth = Math.max(1, Math.round(width / scale));
 			regionHeight = Math.max(1, Math.round(height / scale));
@@ -1144,6 +1175,28 @@ public final class NestedChestOverlay {
 		return null;
 	}
 
+	private static NestedSlotTarget nestedSlotTargetAt(double mouseX, double mouseY) {
+		// 从最上层窗口往下找命中的槽位，重叠 UI 不会误点到父级窗口。
+		for (int i = WINDOWS.size() - 1; i >= 0; i--) {
+			NestedWindow window = WINDOWS.get(i);
+			if (!window.contains(mouseX, mouseY)) {
+				continue;
+			}
+			int slot = window.slotAt(mouseX, mouseY);
+			return slot >= 0 ? new NestedSlotTarget(window, slot) : null;
+		}
+		return null;
+	}
+
+	private static boolean isPointInsideNestedWindow(double mouseX, double mouseY) {
+		for (int i = WINDOWS.size() - 1; i >= 0; i--) {
+			if (WINDOWS.get(i).contains(mouseX, mouseY)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	private static NestedWindow getRaisedWindow() {
 		if (WINDOWS.isEmpty()) {
 			return null;
@@ -1158,10 +1211,16 @@ public final class NestedChestOverlay {
 		return window.slotAt(mouseX, mouseY);
 	}
 
+	private static boolean isDoubleClick(NestedWindow window, int slot, int button) {
+		long now = System.currentTimeMillis();
+		return button == 0 && lastClick != null && lastClick.window == window && lastClick.slot == slot && lastClick.button == button && now - lastClick.time <= 250L;
+	}
+
 	private static void sendMouseClick(NestedWindow window, int slot, int button) {
 		long now = System.currentTimeMillis();
-		boolean doubleClick = button == 0 && lastClick != null && lastClick.window == window && lastClick.slot == slot && lastClick.button == button && now - lastClick.time <= 250L;
+		boolean doubleClick = isDoubleClick(window, slot, button);
 		if (doubleClick) {
+			// 原版双击收集同类物品对应 PICKUP_ALL。
 			sendClick(window, slot, button, SlotActionType.PICKUP_ALL);
 		} else if (Screen.hasShiftDown()) {
 			sendClick(window, slot, button, SlotActionType.QUICK_MOVE);
@@ -1176,6 +1235,14 @@ public final class NestedChestOverlay {
 		ClientPlayNetworking.send(new NestedChestClickPayload(window.path, slot, button, actionType));
 	}
 
+	private static String backgroundModeIcon() {
+		return switch (NestedChestClientConfig.backgroundMode()) {
+			case FIT -> "□";
+			case STRETCH -> "↔";
+			case FILL -> "■";
+		};
+	}
+
 	private static boolean beginQuickCraftIfNeeded(ScreenHandler handler, NestedWindow window, int slot, int button) {
 		if (button != 0 && button != 1) {
 			return false;
@@ -1184,6 +1251,7 @@ public final class NestedChestOverlay {
 		if (client.player == null || handler.getCursorStack().isEmpty()) {
 			return false;
 		}
+		// 鼠标上拿着物品再拖过多个槽位时，走原版 QUICK_CRAFT 三阶段流程。
 		quickCraftDrag = new QuickCraftDrag(window, button);
 		quickCraftDrag.startSlot = slot;
 		return true;
@@ -1300,6 +1368,7 @@ public final class NestedChestOverlay {
 		if (pendingPath.size() == syncedPath.size() && hasSameParentAndLastSlotPair(pendingPath, syncedPath)) {
 			return true;
 		}
+		// 双箱目录可能从右半边点进去，服务端同步回来时会规范到左半边。
 		List<Integer> normalizedPending = normalizeVisiblePathForPairs(pendingPath);
 		return normalizedPending.equals(syncedPath) || normalizeVisiblePathForPairs(syncedPath).equals(pendingPath);
 	}
@@ -1442,10 +1511,11 @@ public final class NestedChestOverlay {
 			MinecraftClient client = MinecraftClient.getInstance();
 			drawPanel(context, x, y, width(), height());
 			fillRoundedRect(context, x + 3, y + 3, width() - 6, TITLE_BAR_HEIGHT - 1, 3, 0x33FFFFFF);
-			context.drawText(client.textRenderer, client.textRenderer.trimToWidth(title.getString(), WINDOW_WIDTH - 148), x + 8, y + 5, 0xFF5A5A5A, false);
-			drawSmallButton(context, mouseX, mouseY, backgroundX(), titleButtonY(), TOOL_BUTTON_WIDTH, WINDOW_CLOSE_SIZE, Text.literal(NestedChestClientConfig.backgroundMode().shortLabel()), backgroundContains(mouseX, mouseY));
-			drawSmallButton(context, mouseX, mouseY, sortX(), titleButtonY(), TOOL_BUTTON_WIDTH, WINDOW_CLOSE_SIZE, Text.literal(sortMode.shortLabel), sortContains(mouseX, mouseY));
-			drawSmallButton(context, mouseX, mouseY, sortDirectionX(), titleButtonY(), TOOL_BUTTON_WIDTH, WINDOW_CLOSE_SIZE, Text.literal(sortAscending ? "正" : "倒"), sortDirectionContains(mouseX, mouseY));
+			int titleWidth = Math.max(0, backgroundX() - x - 10);
+			context.drawText(client.textRenderer, client.textRenderer.trimToWidth(title.getString(), titleWidth), x + 8, y + 5, 0xFF5A5A5A, false);
+			drawSmallButton(context, mouseX, mouseY, backgroundX(), titleButtonY(), TOOL_BUTTON_WIDTH, WINDOW_CLOSE_SIZE, Text.literal(backgroundModeIcon()), backgroundContains(mouseX, mouseY));
+			drawSmallButton(context, mouseX, mouseY, sortX(), titleButtonY(), TOOL_BUTTON_WIDTH, WINDOW_CLOSE_SIZE, Text.literal(sortMode.icon), sortContains(mouseX, mouseY));
+			drawSmallButton(context, mouseX, mouseY, sortDirectionX(), titleButtonY(), TOOL_BUTTON_WIDTH, WINDOW_CLOSE_SIZE, Text.literal(sortAscending ? "↑" : "↓"), sortDirectionContains(mouseX, mouseY));
 			drawSmallButton(context, mouseX, mouseY, extraX(), titleButtonY(), EXTRA_BUTTON_WIDTH, WINDOW_CLOSE_SIZE, Text.literal("+"), extraContains(mouseX, mouseY));
 			drawSmallButton(context, mouseX, mouseY, closeX(), titleButtonY(), WINDOW_CLOSE_SIZE, WINDOW_CLOSE_SIZE, Text.literal("x"), closeContains(mouseX, mouseY));
 
@@ -1611,7 +1681,7 @@ public final class NestedChestOverlay {
 			MinecraftClient client = MinecraftClient.getInstance();
 			this.screen = screen;
 			this.path = List.copyOf(path);
-			this.nameField = new TextFieldWidget(client.textRenderer, 0, 0, RENAME_WIDTH - 20, 20, Text.literal("名称"));
+			this.nameField = new TextFieldWidget(client.textRenderer, 0, 0, RENAME_WIDTH - 20, 20, Text.literal("鍚嶇О"));
 			this.nameField.setMaxLength(NestedChestMod.MAX_CHEST_NAME_LENGTH);
 			this.nameField.setText(stack.contains(DataComponentTypes.CUSTOM_NAME) ? stack.getName().getString() : "");
 			this.nameField.setPlaceholder(stack.getName());
@@ -1635,8 +1705,8 @@ public final class NestedChestOverlay {
 			context.drawText(client.textRenderer, Text.literal("重命名箱子"), x + 8, y + 6, 0xFF5A5A5A, false);
 			fillRoundedRect(context, x + 9, y + 27, RENAME_WIDTH - 18, 22, 3, 0x55919191);
 			nameField.render(context, mouseX, mouseY, 0.0F);
-			drawButton(context, mouseX, mouseY, cancelX(), buttonY(), Text.literal("取消"));
-			drawButton(context, mouseX, mouseY, doneX(), buttonY(), Text.literal("确定"));
+			drawButton(context, mouseX, mouseY, cancelX(), buttonY(), Text.literal("鍙栨秷"));
+			drawButton(context, mouseX, mouseY, doneX(), buttonY(), Text.literal("纭畾"));
 		}
 
 		private boolean mouseClicked(double mouseX, double mouseY, int button) {
@@ -1700,7 +1770,10 @@ public final class NestedChestOverlay {
 	private record ClickMemory(NestedWindow window, int slot, int button, long time) {
 	}
 
-	private record DragPickup(NestedWindow window, boolean startedInNested, int button) {
+	private record NestedSlotTarget(NestedWindow window, int slot) {
+	}
+
+	private record DragPickup(NestedWindow window, boolean startedInNested, int startSlot, int button) {
 	}
 
 	private static final class QuickCraftDrag {
@@ -1719,14 +1792,14 @@ public final class NestedChestOverlay {
 	}
 
 	private enum SortMode {
-		NAME("名"),
-		COUNT("数"),
-		CATEGORY("类");
+		NAME("A"),
+		COUNT("#"),
+		CATEGORY("◆");
 
-		private final String shortLabel;
+		private final String icon;
 
-		SortMode(String shortLabel) {
-			this.shortLabel = shortLabel;
+		SortMode(String icon) {
+			this.icon = icon;
 		}
 
 		private SortMode next() {
@@ -1735,3 +1808,4 @@ public final class NestedChestOverlay {
 		}
 	}
 }
+

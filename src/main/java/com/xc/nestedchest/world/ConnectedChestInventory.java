@@ -28,6 +28,7 @@ public class ConnectedChestInventory implements Inventory {
 	public ConnectedChestInventory(World world, List<ChestBlockEntity> chests) {
 		this.world = world;
 		this.chests = new ArrayList<>(chests);
+		// 固定排序决定“第几个箱子对应哪 27 格”，避免每次打开顺序变化导致物品看起来乱跳。
 		this.chests.sort(Comparator
 				.comparingInt((ChestBlockEntity chest) -> chest.getPos().getY())
 				.thenComparingInt(chest -> chest.getPos().getZ())
@@ -101,6 +102,7 @@ public class ConnectedChestInventory implements Inventory {
 				return false;
 			}
 		}
+		// 距离判定按整个组合体外框算，堆得很高或很长时不会因为离根箱太远而秒关 UI。
 		return bounds.squaredDistanceTo(player.getX(), player.getY(), player.getZ()) <= 64.0D;
 	}
 
@@ -158,6 +160,7 @@ public class ConnectedChestInventory implements Inventory {
 	}
 
 	private void updateLids(int viewerCount) {
+		// 所有组成箱子一起收开盖事件，视觉上像一个整体。
 		for (ChestBlockEntity chest : chests) {
 			world.addSyncedBlockEvent(chest.getPos(), chest.getCachedState().getBlock(), 1, viewerCount);
 		}
@@ -215,6 +218,7 @@ public class ConnectedChestInventory implements Inventory {
 		}
 
 		private double squaredDistanceTo(double x, double y, double z) {
+			// 点在外框内部时该轴距离为 0，只计算玩家到组合体外表面的最短距离。
 			double dx = distanceOutside(x, minX, maxX);
 			double dy = distanceOutside(y, minY, maxY);
 			double dz = distanceOutside(z, minZ, maxZ);

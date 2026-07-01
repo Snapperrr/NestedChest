@@ -63,7 +63,9 @@ public class NestedChestMod implements ModInitializer {
 	public static final int MAX_CHEST_NAME_LENGTH = 32;
 	private static final int DATABASE_CHECKPOINT_TICKS = 20 * 60;
 	private static final long SLOW_OPERATION_WARNING_NANOS = 50_000_000L;
+	// 快速合成会跨多个客户端包分阶段发送，这里按玩家暂存一次原版 ScreenHandler 会话。
 	private static final Map<UUID, QuickCraftSession> QUICK_CRAFT_SESSIONS = new HashMap<>();
+	// 漏斗插入回调拿不到世界对象时，用本线程上下文把当前漏斗所在世界传进来。
 	private static final ThreadLocal<World> HOPPER_TRANSFER_WORLD = new ThreadLocal<>();
 	private static int checkpointTicks;
 
@@ -105,6 +107,7 @@ public class NestedChestMod implements ModInitializer {
 			return;
 		}
 		checkpointTicks = 0;
+		// 周期性 checkpoint WAL，避免意外中断后只留下过大的日志文件。
 		NestedChestStorage.checkpointAll();
 	}
 
@@ -231,6 +234,8 @@ public class NestedChestMod implements ModInitializer {
 			}
 		}
 
+		// 整理时先合并同类堆叠，再排序；箱子和漏斗仍留在原位，避免破坏目录结构和漏斗绑定。
+		movable = mergeSortableStacks(movable);
 		movable.sort(sortComparator(mode, ascending));
 		int movableIndex = 0;
 		for (int slot = 0; slot < sorted.size() && movableIndex < movable.size(); slot++) {
@@ -241,6 +246,40 @@ public class NestedChestMod implements ModInitializer {
 			movableIndex++;
 		}
 		return sorted;
+	}
+
+	private static List<SortableStack> mergeSortableStacks(List<SortableStack> stacks) {
+		List<SortableStack> merged = new ArrayList<>();
+		for (SortableStack sortable : stacks) {
+			ItemStack remaining = sortable.stack().copy();
+			if (remaining.isEmpty()) {
+				continue;
+			}
+			for (SortableStack target : merged) {
+				if (remaining.isEmpty()) {
+					break;
+				}
+				if (!canMergeStacks(target.stack(), remaining)) {
+					continue;
+				}
+				int moved = Math.min(remaining.getCount(), target.stack().getMaxCount() - target.stack().getCount());
+				target.stack().increment(moved);
+				remaining.decrement(moved);
+			}
+			while (!remaining.isEmpty()) {
+				int moved = Math.min(remaining.getCount(), Math.max(1, remaining.getMaxCount()));
+				merged.add(new SortableStack(remaining.copyWithCount(moved), sortable.originalSlot()));
+				remaining.decrement(moved);
+			}
+		}
+		return merged;
+	}
+
+	private static boolean canMergeStacks(ItemStack target, ItemStack source) {
+		return !target.isEmpty()
+				&& !source.isEmpty()
+				&& target.getCount() < target.getMaxCount()
+				&& ItemStack.areItemsAndComponentsEqual(target, source);
 	}
 
 	private static Comparator<SortableStack> sortComparator(SortMode mode, boolean ascending) {
@@ -305,6 +344,7 @@ public class NestedChestMod implements ModInitializer {
 		if (!isChestItem(stack)) {
 			return stack;
 		}
+		// 掉落物不能带目录数据库 ID 或旧版容器组件，否则玩家可以通过拆放复制整棵箱中箱。
 		ItemStack sanitized = new ItemStack(stack.getItem(), stack.getCount());
 		return sanitized;
 	}
@@ -346,6 +386,7 @@ public class NestedChestMod implements ModInitializer {
 		List<ItemStack> pendingChests = new ArrayList<>();
 		pendingChests.add(rootStack.copy());
 
+		// 打破外层箱子时递归吐出深层内容，但所有箱子掉落物本身会被清成空白箱子。
 		while (!pendingChests.isEmpty()) {
 			ItemStack chestStack = pendingChests.removeLast();
 			DefaultedList<ItemStack> storedStacks = loadExistingNestedStacks(storage, chestStack, visitedStorageIds);
@@ -410,6 +451,7 @@ public class NestedChestMod implements ModInitializer {
 		SimpleInventory inventory = copyToInventory(resolved);
 		GenericContainerScreenHandler nestedHandler = createNestedHandler(resolved, realHandler, player, inventory);
 		nestedHandler.setCursorStack(realHandler.getCursorStack().copy());
+		// 让原版 GenericContainerScreenHandler 处理点击，尽量继承原版箱子的双击、Shift、数字键等规则。
 		nestedHandler.onSlotClick(slot, button, actionType, player);
 		realHandler.setCursorStack(nestedHandler.getCursorStack().copy());
 
@@ -422,6 +464,7 @@ public class NestedChestMod implements ModInitializer {
 		if (slot < 0 || resolved.secondary() == null || resolved.path().isEmpty() || originalPath.isEmpty()) {
 			return slot;
 		}
+		// 玩家点的是双箱右半边路径时，服务端会规范到左半边，所以槽位需要平移 27 格。
 		int pathOffset = Math.floorMod(originalPath.getLast(), NESTED_CHEST_SIZE) - Math.floorMod(resolved.path().getLast(), NESTED_CHEST_SIZE);
 		if (pathOffset <= 0 || pathOffset > 1) {
 			return slot;
@@ -512,6 +555,7 @@ public class NestedChestMod implements ModInitializer {
 		List<Integer> normalizedPath = new ArrayList<>(path);
 		ResolvedChest primary = null;
 
+		// 路径里记录的是玩家看到的槽位；遇到成对目录箱时，内部统一落到左侧主箱。
 		for (int depth = 0; depth < normalizedPath.size(); depth++) {
 			int slot = normalizedPath.get(depth);
 			int pairStart = getNestedChestPairStart(container.stacks(), slot);
@@ -625,6 +669,7 @@ public class NestedChestMod implements ModInitializer {
 		if (primaryId.isBlank() || !primaryId.equals(storage.getStorageId(secondary.stack()))) {
 			return false;
 		}
+		// 两个相邻箱子如果意外共用同一个存储 ID，会表现成镜像物品；拆开右箱 ID 让它重新拥有独立页面。
 		storage.removeStorageId(secondary.stack());
 		writeResolvedChestPair(storage, primary, secondary);
 		return true;
@@ -723,6 +768,7 @@ public class NestedChestMod implements ModInitializer {
 	}
 
 	private static void writeChangedAncestorChain(NestedChestStorage storage, Slot rootSlot, List<ResolvedFrame> frames, ItemStack child, int startFrameIndex) {
+		// 子箱子的 ItemStack 变化后，需要从最深层一路写回父箱，最后再写回真正打开的世界箱子槽位。
 		for (int i = startFrameIndex; i >= 0; i--) {
 			ResolvedFrame frame = frames.get(i);
 			if (!stacksEqual(frame.originalChild(), child)) {
@@ -778,6 +824,7 @@ public class NestedChestMod implements ModInitializer {
 		}
 
 		ItemStack display = stack.copy();
+		// 同步给客户端只需要图标和名字，去掉重型组件可以避免书本/容器数据重新把网络包撑爆。
 		display.remove(DataComponentTypes.WRITABLE_BOOK_CONTENT);
 		display.remove(DataComponentTypes.WRITTEN_BOOK_CONTENT);
 		display.remove(DataComponentTypes.CONTAINER);
@@ -798,6 +845,7 @@ public class NestedChestMod implements ModInitializer {
 			return -1;
 		}
 
+		// 箱中箱目录只允许水平两两配对；从连续箱子串的左端开始按 2 格一组切分。
 		int runStart = slot;
 		while (runStart % 9 > 0 && isPairableNestedSlot(stacks, runStart - 1)) {
 			runStart--;
@@ -843,6 +891,7 @@ public class NestedChestMod implements ModInitializer {
 		NestedChestStorage storage = NestedChestStorage.get(world.getServer());
 		ItemStack remaining = stack;
 		boolean[] handledSlots = new boolean[inventory.size()];
+		// 目录箱上方放漏斗作为绑定标记：外部漏斗插入时优先把物品写进该目录箱的数据库页面。
 		for (int slot = 0; slot < inventory.size() && !remaining.isEmpty(); slot++) {
 			if (handledSlots[slot]) {
 				continue;

@@ -28,6 +28,7 @@ public final class ConnectedChestFinder {
 		queue.add(origin.toImmutable());
 		visited.add(origin.toImmutable());
 
+		// 从被打开的箱子开始 BFS，六个方向相邻的箱子都属于同一个超大箱子组。
 		while (!queue.isEmpty() && chests.size() < MAX_CONNECTED_CHESTS) {
 			BlockPos current = queue.remove();
 			BlockEntity blockEntity = world.getBlockEntity(current);

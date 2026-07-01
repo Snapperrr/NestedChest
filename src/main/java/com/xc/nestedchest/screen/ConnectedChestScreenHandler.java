@@ -34,6 +34,7 @@ public class ConnectedChestScreenHandler extends ScreenHandler {
 		this.rows = Math.max(VISIBLE_ROWS, (int) Math.ceil(inventory.size() / (double) COLUMNS));
 		inventory.onOpen(playerInventory.player);
 
+		// 屏幕上永远只放 6 行箱子槽位，滚动时改变这些槽位映射到的真实库存索引。
 		for (int row = 0; row < VISIBLE_ROWS; row++) {
 			for (int column = 0; column < COLUMNS; column++) {
 				addSlot(new ScrollingSlot(inventory, row * COLUMNS + column, 8 + column * 18, 18 + row * 18));
@@ -131,6 +132,7 @@ public class ConnectedChestScreenHandler extends ScreenHandler {
 		for (int i = 0; i < VISIBLE_CHEST_SLOTS; i++) {
 			Slot slot = this.slots.get(i);
 			if (slot instanceof ScrollingSlot scrollingSlot) {
+				// 滚动只换 backingIndex，不重建 ScreenHandler，避免客户端和服务端槽位数量不同步。
 				scrollingSlot.setBackingIndex(scrollRow * COLUMNS + i);
 			}
 		}
@@ -138,6 +140,7 @@ public class ConnectedChestScreenHandler extends ScreenHandler {
 	}
 
 	private class ScrollingSlot extends Slot {
+		// Slot.index 是原版逻辑会读的值，所以这里重写 getIndex 指向当前滚动后的真实槽位。
 		private int backingIndex;
 
 		ScrollingSlot(Inventory inventory, int backingIndex, int x, int y) {

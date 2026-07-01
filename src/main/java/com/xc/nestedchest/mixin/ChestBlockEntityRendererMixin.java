@@ -48,6 +48,7 @@ public abstract class ChestBlockEntityRendererMixin {
 	private static final ModelPart GROUP_BODY = createCuboidPart("group_bottom", 0, 19, 1.0F, 0.0F, 1.0F, 14.0F, 10.0F, 14.0F, EnumSet.allOf(Direction.class), ModelTransform.NONE);
 	private static final ModelPart GROUP_LID = createCuboidPart("group_lid", 0, 0, 1.0F, 0.0F, 0.0F, 14.0F, 5.0F, 14.0F, EnumSet.allOf(Direction.class), ModelTransform.NONE);
 	private static final ModelPart GROUP_LATCH = createCuboidPart("group_latch", 0, 0, 7.0F, -2.0F, 14.0F, 2.0F, 4.0F, 1.0F, EnumSet.allOf(Direction.class), ModelTransform.NONE);
+	// 不同连接形态会产生不同可见面，模型缓存避免每帧重复创建 ModelPart。
 	private static final Map<CellModelKey, CellModels> CELL_MODELS = new ConcurrentHashMap<>();
 	private static final Map<VisualBoxModelKey, CellModels> VISUAL_BOX_MODELS = new ConcurrentHashMap<>();
 
@@ -78,6 +79,7 @@ public abstract class ChestBlockEntityRendererMixin {
 		List<BlockPos> positions = inventory.positions();
 		BlockPos root = findRoot(positions, blockEntity.getPos());
 		if (!blockEntity.getPos().equals(root)) {
+			// 只让根箱子渲染整个组合体，其他组成箱子的原版渲染全部取消，避免重叠闪烁。
 			ci.cancel();
 			return;
 		}
@@ -101,6 +103,7 @@ public abstract class ChestBlockEntityRendererMixin {
 			return state;
 		}
 
+		// 只有标准水平双箱仍交给原版双箱纹理，这样原版外观细节最稳。
 		BlockPos pos = blockEntity.getPos();
 		Direction facing = state.get(ChestBlock.FACING);
 		Direction rightDirection = facing.rotateYCounterclockwise();
@@ -119,6 +122,7 @@ public abstract class ChestBlockEntityRendererMixin {
 		Direction facing = getFacing(rootState, Direction.SOUTH);
 		float openProgress = getGroupOpenProgress(world, positions, tickDelta);
 		if (!isFilledCuboid(positions, root, facing)) {
+			// L/U/环形等非实心形状不能直接渲染成长方体，否则会把空洞填满。
 			LayeredFootprint footprint = LayeredFootprint.from(positions, root, facing);
 			if (footprint != null) {
 				renderLayeredFootprintGroup(rootEntity, world, root, facing, footprint, matrices, vertexConsumers, light, overlay, openProgress);
@@ -153,6 +157,7 @@ public abstract class ChestBlockEntityRendererMixin {
 		}
 
 		if (latchBox != null) {
+			// 非矩形组合只保留一个锁扣，选跨度最长的视觉盒子承载开盖动画。
 			renderVisualBoxLatch(rootEntity, world, latchBox, matrices, vertexConsumers, light, overlay, openProgress);
 		}
 		matrices.pop();
@@ -162,6 +167,7 @@ public abstract class ChestBlockEntityRendererMixin {
 		Set<BlockPos> connected = new HashSet<>(positions);
 		matrices.push();
 		for (BlockPos pos : positions) {
+			// 稀疏形状按单格渲染，并隐藏相邻面的缝隙。
 			BlockEntity cellEntity = world.getBlockEntity(pos);
 			CellConnection connection = CellConnection.from(connected, pos, facing);
 			VertexConsumer consumer = getChestConsumer(cellEntity == null ? rootEntity : cellEntity, connection.textureType(), vertexConsumers);
@@ -438,6 +444,7 @@ public abstract class ChestBlockEntityRendererMixin {
 		if (inventory.chestCount() <= 1) {
 			return false;
 		}
+		// 标准两个水平箱子优先走原版双箱渲染；更多或竖向/异形组合才走自定义模型。
 		return !isVanillaSideBySidePair(world, inventory.positions());
 	}
 
@@ -516,6 +523,7 @@ public abstract class ChestBlockEntityRendererMixin {
 	private record LockOrigin(double x, double y, double z, BlockPos texturePos) {
 		private static LockOrigin from(Set<BlockPos> positions, BlockPos root, Direction facing) {
 			Bounds bounds = Bounds.from(positions);
+			// 锁扣尽量放在组合体正面中心；中心没有箱子时退到最近的正面箱子。
 			double centerX = (bounds.minX + bounds.maxX + 1.0D) * 0.5D - root.getX() - 0.5D;
 			double centerZ = (bounds.minZ + bounds.maxZ + 1.0D) * 0.5D - root.getZ() - 0.5D;
 			double x = centerX;
@@ -696,6 +704,7 @@ public abstract class ChestBlockEntityRendererMixin {
 			for (int y = bounds.minY(); y <= bounds.maxY(); y++) {
 				Set<LocalCell> layer = layers.get(y);
 				if (layer == null || !layer.equals(footprint)) {
+					// 只有每一层投影完全相同时，才能把 L/U/环形挤压成稳定的纵向外观。
 					return null;
 				}
 			}
@@ -725,6 +734,7 @@ public abstract class ChestBlockEntityRendererMixin {
 		private static List<FootprintBox> buildBoxes(Set<LocalCell> footprint, LocalBounds bounds) {
 			Set<LocalCell> remaining = new HashSet<>(footprint);
 			java.util.ArrayList<FootprintBox> boxes = new java.util.ArrayList<>();
+			// 先拆竖向长条，再拆横向长条，把一个异形投影分成尽量少的矩形盒子。
 			for (int x = bounds.minX(); x <= bounds.maxX(); x++) {
 				int startZ = Integer.MIN_VALUE;
 				int previousZ = Integer.MIN_VALUE;

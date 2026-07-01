@@ -20,6 +20,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class HopperBlockEntityMixin {
 	@Inject(method = "serverTick", at = @At("HEAD"))
 	private static void nestedchest$beginHopperTransferWorld(World world, BlockPos pos, BlockState state, HopperBlockEntity blockEntity, CallbackInfo ci) {
+		// transfer 回调只有 Inventory，没有 World；这里用线程上下文把当前漏斗世界传过去。
 		NestedChestMod.setHopperTransferWorld(world);
 	}
 
@@ -32,6 +33,7 @@ public abstract class HopperBlockEntityMixin {
 	private static void nestedchest$transferIntoBoundNestedChest(Inventory from, Inventory to, ItemStack stack, Direction side, CallbackInfoReturnable<ItemStack> cir) {
 		ItemStack remaining = NestedChestMod.transferIntoBoundNestedChest(to, stack);
 		if (remaining.getCount() != stack.getCount()) {
+			// 只在确实写入了箱中箱时截断原版流程，剩余物品继续按漏斗规则处理。
 			cir.setReturnValue(remaining);
 		}
 	}
@@ -43,6 +45,7 @@ public abstract class HopperBlockEntityMixin {
 		}
 		ConnectedChestInventory connectedInventory = ConnectedChestFinder.find(world, pos);
 		if (connectedInventory.chestCount() > 1) {
+			// 漏斗看到的是整个连接箱子组，而不是某一个单独 ChestBlockEntity。
 			cir.setReturnValue(connectedInventory);
 		}
 	}
