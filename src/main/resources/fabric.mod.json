@@ -5,7 +5,6 @@
 	"name": "Nested Chest",
 	"description": "Open chest items inside chest inventories as draggable nested windows.",
 	"authors": [
-		"Codex",
 		"xc"
 	],
 	"contact": {},
