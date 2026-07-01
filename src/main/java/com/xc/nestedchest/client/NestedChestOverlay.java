@@ -3,7 +3,9 @@ package com.xc.nestedchest.client;
 import com.xc.nestedchest.NestedChestMod;
 import com.xc.nestedchest.mixin.ScreenAccessor;
 import com.xc.nestedchest.network.NestedChestClickPayload;
+import com.xc.nestedchest.network.NestedChestOpenPayload;
 import com.xc.nestedchest.network.NestedChestRenamePayload;
+import com.xc.nestedchest.network.NestedChestSortPayload;
 import com.xc.nestedchest.screen.ConnectedChestScreenHandler;
 import com.mojang.blaze3d.systems.RenderSystem;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
@@ -21,28 +23,45 @@ import net.minecraft.text.Text;
 import net.minecraft.util.collection.DefaultedList;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 
 public final class NestedChestOverlay {
 	private static final int SLOT_SIZE = 18;
 	private static final int GRID_COLUMNS = 9;
 	private static final int TITLE_BAR_HEIGHT = 16;
+	private static final int NAV_BAR_HEIGHT = 22;
 	private static final int PADDING = 7;
-	private static final int WINDOW_WIDTH = PADDING * 2 + GRID_COLUMNS * SLOT_SIZE;
+	private static final int GRID_WIDTH = GRID_COLUMNS * SLOT_SIZE;
+	private static final int WINDOW_WIDTH = 232;
+	private static final int PANEL_RADIUS = 4;
+	private static final int BUTTON_RADIUS = 3;
+	private static final int BACK_BUTTON_SIZE = 16;
+	private static final int EXTRA_BUTTON_WIDTH = 20;
+	private static final int TOOL_BUTTON_WIDTH = 22;
+	private static final int PATH_FIELD_HEIGHT = 18;
+	private static final int WINDOW_CLOSE_SIZE = 16;
+	private static final int GLOBAL_CLOSE_SIZE = 12;
 	private static final int RENAME_WIDTH = 190;
 	private static final int RENAME_HEIGHT = 86;
 	private static final int RENAME_BUTTON_WIDTH = 78;
 	private static final int RENAME_BUTTON_HEIGHT = 20;
+	private static final String ROOT_PATH_NAME = "连接箱子";
 	private static final float OVERLAY_Z = 500.0F;
 	private static final float WINDOW_LAYER_Z = 300.0F;
 	private static final float MAX_WINDOW_Z = 6000.0F;
 	private static final float DETAIL_LAYER_Z = 7500.0F;
 	private static final float CURSOR_LAYER_Z = 9000.0F;
 	private static final List<NestedWindow> WINDOWS = new ArrayList<>();
+	private static final Map<List<Integer>, List<String>> PATH_NAME_CACHE = new HashMap<>();
+	private static final Map<List<Integer>, DefaultedList<ItemStack>> PATH_STACK_CACHE = new HashMap<>();
 
 	private static NestedWindow draggedWindow;
 	private static RenameDialog renameDialog;
+	private static TextFieldWidget pathField;
+	private static NestedWindow pathFieldWindow;
 	private static ClickMemory lastClick;
 	private static QuickCraftDrag quickCraftDrag;
 	private static DragPickup dragPickup;
@@ -54,10 +73,13 @@ public final class NestedChestOverlay {
 
 	public static void reset() {
 		WINDOWS.clear();
+		PATH_NAME_CACHE.clear();
+		PATH_STACK_CACHE.clear();
 		draggedWindow = null;
 		lastClick = null;
 		quickCraftDrag = null;
 		dragPickup = null;
+		closePathField();
 		closeRenameDialog(false);
 	}
 
@@ -79,6 +101,10 @@ public final class NestedChestOverlay {
 			renderRootDoubleChestMarkers(handler, context);
 			flushLayer(context);
 		}
+		if (!WINDOWS.isEmpty()) {
+			renderGlobalClose(context, mouseX, mouseY);
+			flushLayer(context);
+		}
 
 		for (int layer = 0; layer < WINDOWS.size(); layer++) {
 			NestedWindow window = WINDOWS.get(layer);
@@ -86,6 +112,9 @@ public final class NestedChestOverlay {
 			context.getMatrices().translate(0.0F, 0.0F, windowLayerZ(layer));
 			RenderSystem.disableDepthTest();
 			window.clampToScreen();
+			if (window == getRaisedWindow()) {
+				bindPathField(window);
+			}
 			window.render(context, mouseX, mouseY);
 			flushLayer(context);
 			context.getMatrices().pop();
@@ -150,11 +179,29 @@ public final class NestedChestOverlay {
 		if (renameDialog != null) {
 			return renameDialog.mouseClicked(mouseX, mouseY, button);
 		}
+		if (pathField != null && pathFieldWindow != null && pathFieldWindow.pathFieldContains(mouseX, mouseY)) {
+			pathField.mouseClicked(mouseX, mouseY, button);
+			pathField.setFocused(true);
+			Screen screen = MinecraftClient.getInstance().currentScreen;
+			if (screen != null) {
+				screen.setFocused(pathField);
+			}
+			return true;
+		}
 
 		if (button != 0 && button != 1) {
 			return false;
 		}
+		if (pathField != null && pathField.isFocused()) {
+			pathField.setFocused(false);
+			updatePathField(pathFieldWindow);
+		}
 		dragPickup = null;
+		if (button == 0 && globalCloseContains(mouseX, mouseY)) {
+			WINDOWS.clear();
+			closePathField();
+			return true;
+		}
 
 		sortForAncestorLayering();
 		for (int i = WINDOWS.size() - 1; i >= 0; i--) {
@@ -164,8 +211,30 @@ public final class NestedChestOverlay {
 			}
 
 			raise(window);
-			if (window.closeContains(mouseX, mouseY)) {
-				removeWindowAndDescendants(window);
+			if (button == 0 && window.closeContains(mouseX, mouseY)) {
+				removeWindow(window);
+				return true;
+			}
+			if (button == 0 && window.backContains(mouseX, mouseY)) {
+				navigateBack(window);
+				return true;
+			}
+			if (button == 0 && window.extraContains(mouseX, mouseY)) {
+				duplicateWindow(window);
+				return true;
+			}
+			if (button == 0 && window.sortContains(mouseX, mouseY)) {
+				ClientPlayNetworking.send(new NestedChestSortPayload(window.path, window.sortMode.ordinal(), window.sortAscending));
+				window.cycleSortMode();
+				return true;
+			}
+			if (button == 0 && window.sortDirectionContains(mouseX, mouseY)) {
+				window.sortAscending = !window.sortAscending;
+				ClientPlayNetworking.send(new NestedChestSortPayload(window.path, window.sortMode.ordinal(), window.sortAscending));
+				return true;
+			}
+			if (button == 0 && window.backgroundContains(mouseX, mouseY)) {
+				NestedChestClientConfig.cycleBackgroundMode();
 				return true;
 			}
 
@@ -188,10 +257,7 @@ public final class NestedChestOverlay {
 						openRenameDialog(window.childPath(nestedSlot), stack);
 					} else {
 						List<Integer> childPath = normalizeChildPath(window, nestedSlot);
-						ContainerView view = window.containerViewForSlot(childPath.getLast());
-						if (view != null) {
-							open(childPath, view);
-						}
+						navigateWindow(window, childPath, containerViewFromSlots(window.stacks, childPath.getLast()));
 					}
 					return true;
 				}
@@ -223,10 +289,7 @@ public final class NestedChestOverlay {
 				openRenameDialog(List.of(parentSlot.id), parentSlot.getStack());
 			} else {
 				List<Integer> path = normalizeRootPath(handler, parentSlot.id);
-				ContainerView view = getContainerViewForPath(handler, path);
-				if (view != null) {
-					open(path, view);
-				}
+				openMain(path, containerViewFromSlots(getRootStacks(handler), path.getLast()));
 			}
 			return true;
 		}
@@ -337,6 +400,19 @@ public final class NestedChestOverlay {
 	}
 
 	public static boolean keyPressed(ScreenHandler handler, int keyCode, int scanCode, int modifiers) {
+		if (pathField != null && pathField.isFocused()) {
+			if (keyCode == 257 || keyCode == 335) {
+				applyPathField(handler);
+				return true;
+			}
+			if (keyCode == 256) {
+				pathField.setFocused(false);
+				updatePathField(pathFieldWindow);
+				return true;
+			}
+			pathField.keyPressed(keyCode, scanCode, modifiers);
+			return true;
+		}
 		if (renameDialog == null) {
 			NestedWindow window = getTopWindow();
 			if (window == null) {
@@ -370,28 +446,418 @@ public final class NestedChestOverlay {
 		return renameDialog.keyPressed(keyCode, scanCode, modifiers);
 	}
 
+	public static boolean charTyped(char chr, int modifiers) {
+		if (pathField != null && pathField.isFocused()) {
+			pathField.charTyped(chr, modifiers);
+			return true;
+		}
+		if (renameDialog != null) {
+			return renameDialog.charTyped(chr, modifiers);
+		}
+		return false;
+	}
+
 	public static void sync(List<Integer> path, DefaultedList<ItemStack> stacks) {
+		ContainerView view = getContainerViewForSyncedPath(path, stacks);
 		for (NestedWindow window : WINDOWS) {
 			if (window.path.equals(path)) {
-				window.setStacks(stacks);
+				window.setPath(path);
+				if (!window.hasPendingDescendantOf(path)) {
+					window.clearPendingPath();
+				}
+				window.setSource(view);
+				rememberPath(path, view);
+				updatePathField(window);
+			}
+		}
+		for (int i = WINDOWS.size() - 1; i >= 0; i--) {
+			NestedWindow window = WINDOWS.get(i);
+			if (window.pendingPathMatches(path)) {
+				window.setPath(path);
+				window.clearPendingPath();
+				window.setSource(view);
+				rememberPath(path, view);
+				updatePathField(window);
+				return;
 			}
 		}
 	}
 
-	private static void open(List<Integer> path, ContainerView view) {
-		for (NestedWindow window : WINDOWS) {
-			if (window.path.equals(path)) {
-				raise(window);
-				return;
+	private static void openMain(List<Integer> path, ContainerView view) {
+		if (view == null) {
+			return;
+		}
+		NestedWindow main = getMainWindow();
+		if (main != null) {
+			navigateWindow(main, path, view);
+			raise(main);
+			return;
+		}
+		openWindow(path, view, true, 0);
+	}
+
+	private static void openWindow(List<Integer> path, ContainerView view, boolean main, int offset) {
+		openWindow(path, view, main, offset, false);
+	}
+
+	private static void openWindow(List<Integer> path, ContainerView view, boolean main, int offset, boolean forceNew) {
+		if (view == null) {
+			return;
+		}
+		if (!forceNew) {
+			for (NestedWindow window : WINDOWS) {
+				if (window.path.equals(path) && window.main == main) {
+					raise(window);
+					window.setPendingPath(path);
+					requestServerSync(path);
+					return;
+				}
 			}
 		}
 
 		MinecraftClient client = MinecraftClient.getInstance();
-		int offset = WINDOWS.size() * 12;
 		int x = clamp((client.getWindow().getScaledWidth() - WINDOW_WIDTH) / 2 + offset, 0, Math.max(0, client.getWindow().getScaledWidth() - WINDOW_WIDTH));
-		NestedWindow window = new NestedWindow(path, x, 24 + offset, view);
+		NestedWindow window = new NestedWindow(path, x, 24 + offset, view, main);
+		window.setPendingPath(path);
+		rememberPath(path, view);
 		window.clampToScreen();
 		WINDOWS.add(window);
+		raise(window);
+		requestServerSync(path);
+	}
+
+	private static void navigateWindow(NestedWindow window, List<Integer> path, ContainerView view) {
+		if (view == null) {
+			return;
+		}
+		window.setPath(path);
+		window.setPendingPath(path);
+		window.setSource(view);
+		rememberPath(path, view);
+		updatePathField(window);
+		requestServerSync(path);
+	}
+
+	private static void navigateBack(NestedWindow window) {
+		if (window.path.size() <= 1) {
+			return;
+		}
+		List<Integer> parentPath = List.copyOf(window.path.subList(0, window.path.size() - 1));
+		ContainerView view = containerViewFromPath(parentPath);
+		if (view == null) {
+			view = placeholderView(parentPath);
+		}
+		navigateWindow(window, parentPath, view);
+	}
+
+	private static void duplicateWindow(NestedWindow window) {
+		int offset = WINDOWS.size() * 12;
+		openWindow(window.path, new ContainerView(window.title, window.stacks), false, offset, true);
+	}
+
+	private static NestedWindow getMainWindow() {
+		for (NestedWindow window : WINDOWS) {
+			if (window.main) {
+				return window;
+			}
+		}
+		return null;
+	}
+
+	private static void removeWindow(NestedWindow window) {
+		WINDOWS.remove(window);
+		if (pathFieldWindow == window) {
+			pathFieldWindow = null;
+			if (WINDOWS.isEmpty()) {
+				closePathField();
+			} else {
+				bindPathField(getRaisedWindow());
+			}
+		}
+	}
+
+	private static void renderGlobalClose(DrawContext context, int mouseX, int mouseY) {
+		MinecraftClient client = MinecraftClient.getInstance();
+		int x = client.getWindow().getScaledWidth() - GLOBAL_CLOSE_SIZE - 4;
+		int y = 4;
+		drawSmallButton(context, mouseX, mouseY, x, y, GLOBAL_CLOSE_SIZE, GLOBAL_CLOSE_SIZE, Text.literal("x"), globalCloseContains(mouseX, mouseY));
+	}
+
+	private static boolean globalCloseContains(double mouseX, double mouseY) {
+		if (WINDOWS.isEmpty()) {
+			return false;
+		}
+		MinecraftClient client = MinecraftClient.getInstance();
+		int x = client.getWindow().getScaledWidth() - GLOBAL_CLOSE_SIZE - 4;
+		int y = 4;
+		return mouseX >= x && mouseX < x + GLOBAL_CLOSE_SIZE && mouseY >= y && mouseY < y + GLOBAL_CLOSE_SIZE;
+	}
+
+	private static void bindPathField(NestedWindow window) {
+		if (window == null) {
+			closePathField();
+			return;
+		}
+		Screen screen = MinecraftClient.getInstance().currentScreen;
+		if (screen == null) {
+			return;
+		}
+		if (pathField == null) {
+			pathField = new TextFieldWidget(MinecraftClient.getInstance().textRenderer, 0, 0, 1, PATH_FIELD_HEIGHT, Text.literal("路径"));
+			pathField.setMaxLength(160);
+			((ScreenAccessor) screen).nestedchest$addSelectableChild(pathField);
+		}
+		if (pathFieldWindow != window) {
+			pathFieldWindow = window;
+			updatePathField(window);
+			pathField.setFocused(false);
+		}
+		pathField.setDimensionsAndPosition(window.pathFieldWidth(), PATH_FIELD_HEIGHT, window.pathFieldX(), window.pathFieldY());
+	}
+
+	private static void closePathField() {
+		if (pathField == null) {
+			pathFieldWindow = null;
+			return;
+		}
+		Screen screen = MinecraftClient.getInstance().currentScreen;
+		if (screen != null) {
+			((ScreenAccessor) screen).nestedchest$remove(pathField);
+		}
+		pathField = null;
+		pathFieldWindow = null;
+	}
+
+	private static void updatePathField(NestedWindow window) {
+		if (pathField != null && window != null && pathFieldWindow == window && !pathField.isFocused()) {
+			pathField.setText(formatPath(window.path, window.title));
+		}
+	}
+
+	private static void applyPathField(ScreenHandler handler) {
+		if (pathField == null || pathFieldWindow == null) {
+			return;
+		}
+		List<Integer> path = parsePath(handler, pathField.getText());
+		if (path.isEmpty()) {
+			updatePathField(pathFieldWindow);
+			pathField.setFocused(false);
+			return;
+		}
+		ContainerView view = containerViewFromPath(path);
+		if (view == null) {
+			view = placeholderView(path);
+		}
+		navigateWindow(pathFieldWindow, path, view);
+		pathField.setFocused(false);
+	}
+
+	private static String formatPath(List<Integer> path, Text fallbackTitle) {
+		List<String> names = PATH_NAME_CACHE.get(path);
+		if (names == null) {
+			names = buildNamePathFromVisibleState(path, fallbackTitle);
+		}
+		return String.join("/", names);
+	}
+
+	private static List<String> buildNamePathFromVisibleState(List<Integer> path, Text fallbackTitle) {
+		List<String> names = new ArrayList<>();
+		names.add(rootPathName());
+		for (int depth = 0; depth < path.size(); depth++) {
+			List<Integer> currentPath = List.copyOf(path.subList(0, depth + 1));
+			List<String> cached = PATH_NAME_CACHE.get(currentPath);
+			if (cached != null && cached.size() > depth + 1) {
+				names = new ArrayList<>(cached);
+				continue;
+			}
+			Text name = depth == path.size() - 1 && fallbackTitle != null ? fallbackTitle : stackNameForPathPrefix(currentPath);
+			names.add(sanitizePathSegment(name == null ? Text.literal(String.valueOf(path.get(depth) + 1)) : name));
+		}
+		return names;
+	}
+
+	private static List<Integer> parsePath(ScreenHandler handler, String rawPath) {
+		String cleaned = rawPath.trim().replace('\\', '/');
+		if (cleaned.isEmpty()) {
+			return List.of();
+		}
+		String root = rootPathName();
+		if (cleaned.equals(root)) {
+			return List.of();
+		}
+		if (cleaned.startsWith(root + "/")) {
+			cleaned = cleaned.substring(root.length() + 1);
+		} else if (cleaned.startsWith(ROOT_PATH_NAME + "/")) {
+			cleaned = cleaned.substring(ROOT_PATH_NAME.length() + 1);
+		}
+		while (cleaned.startsWith("/")) {
+			cleaned = cleaned.substring(1);
+		}
+		if (cleaned.isBlank()) {
+			return List.of();
+		}
+		String[] parts = cleaned.split("/+");
+		List<Integer> path = new ArrayList<>();
+		DefaultedList<ItemStack> currentStacks = getRootStacks(handler);
+		for (String part : parts) {
+			String segment = sanitizePathSegment(Text.literal(part.trim()));
+			if (segment.isBlank()) {
+				continue;
+			}
+			int slot = findNamedSlot(currentStacks, segment);
+			if (slot < 0) {
+				return List.of();
+			}
+			path.add(slot);
+			DefaultedList<ItemStack> cachedStacks = PATH_STACK_CACHE.get(List.copyOf(path));
+			if (cachedStacks != null) {
+				currentStacks = cachedStacks;
+				continue;
+			}
+			ContainerView view = containerViewFromSlots(currentStacks, slot);
+			if (view == null && path.size() < parts.length) {
+				return List.of();
+			} else if (view != null) {
+				currentStacks = view.stacks();
+			}
+		}
+		return List.copyOf(path);
+	}
+
+	private static ContainerView placeholderView(List<Integer> path) {
+		return new ContainerView(Text.literal(lastPathSegment(path)), DefaultedList.ofSize(NestedChestMod.NESTED_CHEST_SIZE, ItemStack.EMPTY));
+	}
+
+	private static String rootPathName() {
+		Screen screen = MinecraftClient.getInstance().currentScreen;
+		if (screen != null) {
+			String title = sanitizePathSegment(screen.getTitle());
+			if (!title.isBlank()) {
+				return title;
+			}
+		}
+		return ROOT_PATH_NAME;
+	}
+
+	private static String sanitizePathSegment(Text text) {
+		if (text == null) {
+			return "";
+		}
+		String value = text.getString().trim().replace('\\', '/').replace('/', '_');
+		value = value.replaceFirst("\\s+[xX×]\\s*\\{?\\d+\\}?$", "").trim();
+		return value.isBlank() ? ROOT_PATH_NAME : value;
+	}
+
+	private static Text stackNameForPathPrefix(List<Integer> path) {
+		MinecraftClient client = MinecraftClient.getInstance();
+		if (client.player == null || path.isEmpty()) {
+			return null;
+		}
+		ItemStack stack = getStackForPath(client.player.currentScreenHandler, path);
+		return stack.isEmpty() ? null : stack.getName();
+	}
+
+	private static int findNamedSlot(DefaultedList<ItemStack> stacks, String segment) {
+		for (int slot = 0; slot < stacks.size(); slot++) {
+			ItemStack stack = stacks.get(slot);
+			if (NestedChestMod.canOpenNestedWindow(stack) && sanitizePathSegment(stack.getName()).equals(segment)) {
+				return normalizeSlotForPair(stacks, slot);
+			}
+		}
+		int numericSlot = parseNumericSlot(segment);
+		if (numericSlot < 0 || numericSlot >= stacks.size()) {
+			return -1;
+		}
+		return NestedChestMod.canOpenNestedWindow(stacks.get(numericSlot)) ? normalizeSlotForPair(stacks, numericSlot) : numericSlot;
+	}
+
+	private static int parseNumericSlot(String segment) {
+		try {
+			int slot = Integer.parseInt(segment) - 1;
+			return slot >= 0 && slot < NestedChestMod.MAX_NESTED_CHEST_SIZE ? slot : -1;
+		} catch (NumberFormatException ignored) {
+			return -1;
+		}
+	}
+
+	private static int normalizeSlotForPair(DefaultedList<ItemStack> stacks, int slot) {
+		int pairStart = NestedChestMod.getNestedChestPairStart(stacks, slot);
+		return pairStart >= 0 ? pairStart : slot;
+	}
+
+	private static void rememberPath(List<Integer> path, ContainerView view) {
+		PATH_STACK_CACHE.put(List.copyOf(path), copyStacks(view.stacks()));
+		List<String> names = new ArrayList<>();
+		if (path.size() > 1) {
+			List<String> parentNames = PATH_NAME_CACHE.get(List.copyOf(path.subList(0, path.size() - 1)));
+			if (parentNames != null) {
+				names.addAll(parentNames);
+			}
+		}
+		if (names.isEmpty()) {
+			names.add(rootPathName());
+		}
+		if (names.size() > path.size()) {
+			names = new ArrayList<>(names.subList(0, path.size()));
+		}
+		while (names.size() < path.size()) {
+			int depth = names.size() - 1;
+			List<Integer> prefix = List.copyOf(path.subList(0, depth + 1));
+			Text name = stackNameForPathPrefix(prefix);
+			names.add(sanitizePathSegment(name == null ? Text.literal(String.valueOf(path.get(depth) + 1)) : name));
+		}
+		names.add(sanitizePathSegment(view.title()));
+		PATH_NAME_CACHE.put(List.copyOf(path), List.copyOf(names));
+	}
+
+	private static String lastPathSegment(List<Integer> path) {
+		List<String> names = PATH_NAME_CACHE.get(path);
+		if (names == null) {
+			names = buildNamePathFromVisibleState(path, null);
+		}
+		if (!names.isEmpty()) {
+			return names.getLast();
+		}
+		return path.isEmpty() ? rootPathName() : String.valueOf(path.getLast() + 1);
+	}
+
+	private static DefaultedList<ItemStack> copyStacks(DefaultedList<ItemStack> source) {
+		DefaultedList<ItemStack> copy = DefaultedList.ofSize(source.size(), ItemStack.EMPTY);
+		for (int i = 0; i < source.size(); i++) {
+			copy.set(i, source.get(i).copy());
+		}
+		return copy;
+	}
+
+	private static ContainerView containerViewFromPath(List<Integer> path) {
+		MinecraftClient client = MinecraftClient.getInstance();
+		if (client.player == null || path.isEmpty()) {
+			return null;
+		}
+		if (path.size() == 1) {
+			return containerViewFromSlots(getRootStacks(client.player.currentScreenHandler), path.getFirst());
+		}
+		NestedWindow parent = findWindow(List.copyOf(path.subList(0, path.size() - 1)));
+		if (parent == null) {
+			return null;
+		}
+		return containerViewFromSlots(parent.stacks, path.getLast());
+	}
+
+	private static ContainerView getContainerViewForSyncedPath(List<Integer> path, DefaultedList<ItemStack> stacks) {
+		Text title = Text.literal(lastPathSegment(path));
+		MinecraftClient client = MinecraftClient.getInstance();
+		if (client.player != null) {
+			ItemStack stack = getStackForPath(client.player.currentScreenHandler, path);
+			if (!stack.isEmpty()) {
+				title = stack.getName();
+			}
+		}
+		return new ContainerView(title, stacks);
+	}
+
+	private static void requestServerSync(List<Integer> path) {
+		ClientPlayNetworking.send(new NestedChestOpenPayload(path));
 	}
 
 	private static void openRenameDialog(List<Integer> path, ItemStack stack) {
@@ -483,6 +949,116 @@ public final class NestedChestOverlay {
 		context.drawVerticalLine(x + SLOT_SIZE - 1, y, y + SLOT_SIZE - 3, 0x661E8E50);
 	}
 
+	private static void drawPanel(DrawContext context, int x, int y, int width, int height) {
+		fillRoundedRect(context, x + 2, y + 3, width, height, PANEL_RADIUS, 0x66000000);
+		fillRoundedRect(context, x, y, width, height, PANEL_RADIUS, 0xFFC6C6C6);
+		drawRoundedBorder(context, x, y, width, height, PANEL_RADIUS, 0xFFFFFFFF, 0xFF595959);
+		drawRoundedBorder(context, x + 1, y + 1, width - 2, height - 2, PANEL_RADIUS - 1, 0xFFE7E7E7, 0xFF8A8A8A);
+	}
+
+	private static void drawSlot(DrawContext context, int x, int y) {
+		drawSlot(context, x, y, false);
+	}
+
+	private static void drawSlot(DrawContext context, int x, int y, boolean translucentCenter) {
+		if (translucentCenter) {
+			context.drawHorizontalLine(x, x + SLOT_SIZE - 1, y, 0xB06A6A6A);
+			context.drawVerticalLine(x, y, y + SLOT_SIZE - 1, 0xB06A6A6A);
+			context.drawHorizontalLine(x + 1, x + SLOT_SIZE - 2, y + 1, 0xAA3F3F3F);
+			context.drawVerticalLine(x + 1, y + 1, y + SLOT_SIZE - 2, 0xAA3F3F3F);
+			context.drawHorizontalLine(x + 1, x + SLOT_SIZE - 2, y + SLOT_SIZE - 2, 0xCCE6E6E6);
+			context.drawVerticalLine(x + SLOT_SIZE - 2, y + 1, y + SLOT_SIZE - 2, 0xCCE6E6E6);
+			return;
+		}
+		context.fill(x, y, x + SLOT_SIZE, y + SLOT_SIZE, 0xFF6A6A6A);
+		context.fill(x + 1, y + 1, x + SLOT_SIZE - 1, y + SLOT_SIZE - 1, 0xFF8A8A8A);
+		context.drawHorizontalLine(x + 1, x + SLOT_SIZE - 2, y + 1, 0xFF3F3F3F);
+		context.drawVerticalLine(x + 1, y + 1, y + SLOT_SIZE - 2, 0xFF3F3F3F);
+		context.drawHorizontalLine(x + 1, x + SLOT_SIZE - 2, y + SLOT_SIZE - 2, 0xFFE6E6E6);
+		context.drawVerticalLine(x + SLOT_SIZE - 2, y + 1, y + SLOT_SIZE - 2, 0xFFE6E6E6);
+		context.fill(x + 2, y + 2, x + SLOT_SIZE - 2, y + SLOT_SIZE - 2, 0xFFB7B7B7);
+	}
+
+	private static boolean drawGridBackgroundImage(DrawContext context, int x, int y, int width, int height) {
+		NestedChestClientConfig.LoadedBackground background = NestedChestClientConfig.background();
+		if (background == null || background.width() <= 0 || background.height() <= 0) {
+			return false;
+		}
+
+		int drawX = x;
+		int drawY = y;
+		int drawWidth = width;
+		int drawHeight = height;
+		float u = 0.0F;
+		float v = 0.0F;
+		int regionWidth = background.width();
+		int regionHeight = background.height();
+
+		NestedChestClientConfig.BackgroundMode mode = NestedChestClientConfig.backgroundMode();
+		if (mode == NestedChestClientConfig.BackgroundMode.FIT) {
+			float scale = Math.min(width / (float) background.width(), height / (float) background.height());
+			drawWidth = Math.max(1, Math.round(background.width() * scale));
+			drawHeight = Math.max(1, Math.round(background.height() * scale));
+			drawX = x + (width - drawWidth) / 2;
+			drawY = y + (height - drawHeight) / 2;
+		} else if (mode == NestedChestClientConfig.BackgroundMode.FILL) {
+			float scale = Math.max(width / (float) background.width(), height / (float) background.height());
+			regionWidth = Math.max(1, Math.round(width / scale));
+			regionHeight = Math.max(1, Math.round(height / scale));
+			u = (background.width() - regionWidth) / 2.0F;
+			v = (background.height() - regionHeight) / 2.0F;
+		}
+
+		context.draw();
+		RenderSystem.enableBlend();
+		RenderSystem.defaultBlendFunc();
+		context.enableScissor(x, y, x + width, y + height);
+		context.drawTexture(background.texture(), drawX, drawY, drawWidth, drawHeight, u, v, regionWidth, regionHeight, background.width(), background.height());
+		context.disableScissor();
+		context.draw();
+		RenderSystem.disableBlend();
+		return true;
+	}
+
+	private static void drawSmallButton(DrawContext context, int mouseX, int mouseY, int x, int y, int width, int height, Text label, boolean hovered) {
+		MinecraftClient client = MinecraftClient.getInstance();
+		int base = hovered ? 0xFFE4E4E4 : 0xFFC9C9C9;
+		fillRoundedRect(context, x + 1, y + 2, width, height, BUTTON_RADIUS, 0x55000000);
+		fillRoundedRect(context, x, y, width, height, BUTTON_RADIUS, base);
+		drawRoundedBorder(context, x, y, width, height, BUTTON_RADIUS, hovered ? 0xFFFFFFFF : 0xFFF2F2F2, 0xFF505050);
+		context.drawHorizontalLine(x + 2, x + width - 3, y + 1, hovered ? 0xFFFFFFFF : 0xFFECECEC);
+		context.drawHorizontalLine(x + 2, x + width - 3, y + height - 2, 0xFF8A8A8A);
+		int textWidth = client.textRenderer.getWidth(label);
+		context.drawText(client.textRenderer, label, x + (width - textWidth) / 2, y + (height - 8) / 2, 0xFF404040, false);
+	}
+
+	private static void fillRoundedRect(DrawContext context, int x, int y, int width, int height, int radius, int color) {
+		if (radius <= 0) {
+			context.fill(x, y, x + width, y + height, color);
+			return;
+		}
+		context.fill(x + radius, y, x + width - radius, y + height, color);
+		context.fill(x, y + radius, x + width, y + height - radius, color);
+		context.fill(x + 1, y + 1, x + width - 1, y + radius, color);
+		context.fill(x + 1, y + height - radius, x + width - 1, y + height - 1, color);
+		context.fill(x, y + radius, x + radius, y + height - radius, color);
+		context.fill(x + width - radius, y + radius, x + width, y + height - radius, color);
+	}
+
+	private static void drawRoundedBorder(DrawContext context, int x, int y, int width, int height, int radius, int lightColor, int darkColor) {
+		if (width <= 1 || height <= 1) {
+			return;
+		}
+		context.drawHorizontalLine(x + radius, x + width - radius - 1, y, lightColor);
+		context.drawVerticalLine(x, y + radius, y + height - radius - 1, lightColor);
+		context.drawHorizontalLine(x + radius, x + width - radius - 1, y + height - 1, darkColor);
+		context.drawVerticalLine(x + width - 1, y + radius, y + height - radius - 1, darkColor);
+		context.fill(x + 1, y + 1, x + radius + 1, y + 2, lightColor);
+		context.fill(x + 1, y + 1, x + 2, y + radius + 1, lightColor);
+		context.fill(x + width - radius - 1, y + height - 2, x + width - 1, y + height - 1, darkColor);
+		context.fill(x + width - 2, y + height - radius - 1, x + width - 1, y + height - 1, darkColor);
+	}
+
 	private static Slot getParentSlotAt(ScreenHandler handler, double mouseX, double mouseY) {
 		for (int i = 0; i < containerSlotCount(handler) && i < handler.slots.size(); i++) {
 			Slot slot = handler.getSlot(i);
@@ -517,12 +1093,23 @@ public final class NestedChestOverlay {
 	private static void removeInvalidWindows(ScreenHandler handler) {
 		for (Iterator<NestedWindow> iterator = WINDOWS.iterator(); iterator.hasNext(); ) {
 			NestedWindow window = iterator.next();
-			ContainerView view = getContainerViewForPath(handler, window.path);
-			if (view == null) {
-				iterator.remove();
+			ItemStack stack = getStackForPath(handler, window.path);
+			if (stack.isEmpty() && window.path.size() > 1) {
 				continue;
 			}
-			window.setSource(view);
+			if (!NestedChestMod.canOpenNestedWindow(stack)) {
+				iterator.remove();
+				if (pathFieldWindow == window) {
+					pathFieldWindow = null;
+				}
+				continue;
+			}
+			window.setTitle(stack.getName());
+		}
+		if (WINDOWS.isEmpty()) {
+			closePathField();
+		} else if (pathFieldWindow == null) {
+			bindPathField(getRaisedWindow());
 		}
 	}
 
@@ -585,6 +1172,7 @@ public final class NestedChestOverlay {
 	}
 
 	private static void sendClick(NestedWindow window, int slot, int button, SlotActionType actionType) {
+		window.setPendingPath(window.path);
 		ClientPlayNetworking.send(new NestedChestClickPayload(window.path, slot, button, actionType));
 	}
 
@@ -630,69 +1218,26 @@ public final class NestedChestOverlay {
 		}
 	}
 
-	private static ContainerView getContainerViewForPath(ScreenHandler handler, List<Integer> path) {
-		if (path.isEmpty()) {
-			return null;
-		}
-
-		int rootSlot = path.getFirst();
-		if (rootSlot < 0 || rootSlot >= containerSlotCount(handler) || rootSlot >= handler.slots.size()) {
-			return null;
-		}
-
-		ItemStack current = handler.getSlot(rootSlot).getStack();
-		if (!NestedChestMod.canOpenNestedWindow(current)) {
-			return null;
-		}
-
-		ContainerView view = containerViewFromSlots(getRootStacks(handler), rootSlot);
-		for (int i = 1; i < path.size(); i++) {
-			if (view == null) {
-				return null;
-			}
-			int nestedSlot = path.get(i);
-			if (nestedSlot < 0 || nestedSlot >= view.stacks.size()) {
-				return null;
-			}
-			current = view.stacks.get(nestedSlot);
-			if (!NestedChestMod.canOpenNestedWindow(current)) {
-				return null;
-			}
-			view = containerViewFromSlots(view.stacks, nestedSlot);
-		}
-
-		return view;
-	}
-
 	private static ItemStack getStackForPath(ScreenHandler handler, List<Integer> path) {
 		if (path.isEmpty()) {
 			return ItemStack.EMPTY;
 		}
 
-		int rootSlot = path.getFirst();
-		if (rootSlot < 0 || rootSlot >= containerSlotCount(handler) || rootSlot >= handler.slots.size()) {
-			return ItemStack.EMPTY;
-		}
-
-		ItemStack current = handler.getSlot(rootSlot).getStack();
-		if (!NestedChestMod.canOpenNestedWindow(current)) {
-			return ItemStack.EMPTY;
-		}
-
-		ContainerView view = containerViewFromSlots(getRootStacks(handler), rootSlot);
-		for (int i = 1; i < path.size(); i++) {
-			int nestedSlot = path.get(i);
-			if (view == null || nestedSlot < 0 || nestedSlot >= view.stacks.size()) {
+		if (path.size() == 1) {
+			int rootSlot = path.getFirst();
+			if (rootSlot < 0 || rootSlot >= containerSlotCount(handler) || rootSlot >= handler.slots.size()) {
 				return ItemStack.EMPTY;
 			}
-			current = view.stacks.get(nestedSlot);
-			if (!NestedChestMod.canOpenNestedWindow(current)) {
-				return ItemStack.EMPTY;
-			}
-			view = containerViewFromSlots(view.stacks, nestedSlot);
+			return handler.getSlot(rootSlot).getStack();
 		}
 
-		return current;
+		List<Integer> parentPath = List.copyOf(path.subList(0, path.size() - 1));
+		NestedWindow parent = findWindow(parentPath);
+		int nestedSlot = path.getLast();
+		if (parent == null || nestedSlot < 0 || nestedSlot >= parent.stacks.size()) {
+			return ItemStack.EMPTY;
+		}
+		return parent.stacks.get(nestedSlot);
 	}
 
 	private static DefaultedList<ItemStack> getRootStacks(ScreenHandler handler) {
@@ -713,19 +1258,97 @@ public final class NestedChestOverlay {
 		}
 
 		DefaultedList<ItemStack> nestedStacks = DefaultedList.ofSize(NestedChestMod.NESTED_CHEST_SIZE, ItemStack.EMPTY);
-		copyInto(nestedStacks, 0, NestedChestMod.getNestedStacks(primary));
 		int secondarySlot = NestedChestMod.getNestedChestPairSecondarySlot(stacks, slot);
 		if (secondarySlot >= 0) {
 			DefaultedList<ItemStack> doubleStacks = DefaultedList.ofSize(NestedChestMod.DOUBLE_NESTED_CHEST_SIZE, ItemStack.EMPTY);
-			copyInto(doubleStacks, 0, nestedStacks);
-			copyInto(doubleStacks, NestedChestMod.NESTED_CHEST_SIZE, NestedChestMod.getNestedStacks(stacks.get(secondarySlot)));
 			return new ContainerView(primary.getName(), doubleStacks);
 		}
 		return new ContainerView(primary.getName(), nestedStacks);
 	}
 
+	private static NestedWindow findWindow(List<Integer> path) {
+		for (NestedWindow window : WINDOWS) {
+			if (window.path.equals(path)) {
+				return window;
+			}
+		}
+		return null;
+	}
+
 	private static boolean isNestedPairStart(DefaultedList<ItemStack> stacks, int slot) {
 		return NestedChestMod.getNestedChestPairSecondarySlot(stacks, slot) >= 0;
+	}
+
+	private static boolean hasSameParentAndLastSlotPair(List<Integer> left, List<Integer> right) {
+		if (left.size() != right.size() || left.isEmpty()) {
+			return false;
+		}
+		int lastIndex = left.size() - 1;
+		if (!left.subList(0, lastIndex).equals(right.subList(0, lastIndex))) {
+			return false;
+		}
+		return Math.abs(left.get(lastIndex) - right.get(lastIndex)) == 1;
+	}
+
+	private static boolean pathsMatchForSync(List<Integer> pendingPath, List<Integer> syncedPath) {
+		if (pendingPath.isEmpty()) {
+			return false;
+		}
+		if (pendingPath.equals(syncedPath)) {
+			return true;
+		}
+		if (pendingPath.size() == syncedPath.size() && hasSameParentAndLastSlotPair(pendingPath, syncedPath)) {
+			return true;
+		}
+		List<Integer> normalizedPending = normalizeVisiblePathForPairs(pendingPath);
+		return normalizedPending.equals(syncedPath) || normalizeVisiblePathForPairs(syncedPath).equals(pendingPath);
+	}
+
+	private static List<Integer> normalizeVisiblePathForPairs(List<Integer> path) {
+		MinecraftClient client = MinecraftClient.getInstance();
+		if (client.player == null || path.isEmpty()) {
+			return path;
+		}
+
+		List<Integer> normalizedPath = new ArrayList<>(path);
+		DefaultedList<ItemStack> currentStacks = getRootStacks(client.player.currentScreenHandler);
+		for (int depth = 0; depth < normalizedPath.size(); depth++) {
+			int slot = normalizedPath.get(depth);
+			int pairStart = NestedChestMod.getNestedChestPairStart(currentStacks, slot);
+			if (pairStart >= 0 && pairStart < slot) {
+				int slotOffset = slot - pairStart;
+				slot = pairStart;
+				normalizedPath.set(depth, pairStart);
+				if (depth + 1 < normalizedPath.size()) {
+					normalizedPath.set(depth + 1, normalizedPath.get(depth + 1) + slotOffset * NestedChestMod.NESTED_CHEST_SIZE);
+				}
+			} else if (depth == normalizedPath.size() - 1 && pairStart >= 0) {
+				slot = pairStart;
+				normalizedPath.set(depth, pairStart);
+			}
+
+			if (depth + 1 < normalizedPath.size()) {
+				DefaultedList<ItemStack> nextStacks = stacksForVisiblePathPrefix(List.copyOf(normalizedPath.subList(0, depth + 1)), currentStacks, slot);
+				if (nextStacks == null) {
+					break;
+				}
+				currentStacks = nextStacks;
+			}
+		}
+		return List.copyOf(normalizedPath);
+	}
+
+	private static DefaultedList<ItemStack> stacksForVisiblePathPrefix(List<Integer> prefix, DefaultedList<ItemStack> parentStacks, int slot) {
+		NestedWindow window = findWindow(prefix);
+		if (window != null) {
+			return window.stacks;
+		}
+		DefaultedList<ItemStack> cached = PATH_STACK_CACHE.get(prefix);
+		if (cached != null) {
+			return cached;
+		}
+		ContainerView view = containerViewFromSlots(parentStacks, slot);
+		return view == null ? null : view.stacks();
 	}
 
 	private static void copyInto(DefaultedList<ItemStack> target, int offset, DefaultedList<ItemStack> source) {
@@ -753,22 +1376,51 @@ public final class NestedChestOverlay {
 	}
 
 	private static final class NestedWindow {
-		private final List<Integer> path;
+		private List<Integer> path;
+		private List<Integer> pendingPath = List.of();
+		private final boolean main;
 		private DefaultedList<ItemStack> stacks = DefaultedList.ofSize(NestedChestMod.NESTED_CHEST_SIZE, ItemStack.EMPTY);
 		private Text title;
+		private SortMode sortMode = SortMode.NAME;
+		private boolean sortAscending = true;
 		private int x;
 		private int y;
 
-		private NestedWindow(List<Integer> path, int x, int y, ContainerView view) {
+		private NestedWindow(List<Integer> path, int x, int y, ContainerView view, boolean main) {
 			this.path = List.copyOf(path);
+			this.main = main;
 			this.x = x;
 			this.y = y;
 			setSource(view);
 		}
 
+		private void setPath(List<Integer> path) {
+			this.path = List.copyOf(path);
+		}
+
+		private void setPendingPath(List<Integer> path) {
+			this.pendingPath = List.copyOf(path);
+		}
+
+		private void clearPendingPath() {
+			this.pendingPath = List.of();
+		}
+
+		private boolean pendingPathMatches(List<Integer> path) {
+			return pathsMatchForSync(this.pendingPath, path);
+		}
+
+		private boolean hasPendingDescendantOf(List<Integer> path) {
+			return !this.pendingPath.isEmpty() && isProperDescendant(this.pendingPath, path);
+		}
+
 		private void setSource(ContainerView view) {
 			this.title = view.title();
 			setStacks(view.stacks());
+		}
+
+		private void setTitle(Text title) {
+			this.title = title;
 		}
 
 		private void setStacks(DefaultedList<ItemStack> source) {
@@ -786,28 +1438,42 @@ public final class NestedChestOverlay {
 			return List.copyOf(childPath);
 		}
 
-		private ContainerView containerViewForSlot(int slot) {
-			return containerViewFromSlots(this.stacks, slot);
-		}
-
 		private void render(DrawContext context, int mouseX, int mouseY) {
 			MinecraftClient client = MinecraftClient.getInstance();
-			context.fill(x + 2, y + 3, x + width() + 2, y + height() + 3, 0x66000000);
-			context.fill(x, y, x + width(), y + height(), 0xFFF7F7F7);
-			context.fill(x, y, x + WINDOW_WIDTH, y + TITLE_BAR_HEIGHT, 0xFF3A4D5F);
-			context.drawText(client.textRenderer, client.textRenderer.trimToWidth(title.getString(), WINDOW_WIDTH - 28), x + 6, y + 5, 0xFFFFFFFF, false);
-			context.drawText(client.textRenderer, Text.literal("x"), x + WINDOW_WIDTH - 12, y + 5, 0xFFFFFFFF, false);
-			context.drawBorder(x, y, width(), height(), 0xFF202830);
+			drawPanel(context, x, y, width(), height());
+			fillRoundedRect(context, x + 3, y + 3, width() - 6, TITLE_BAR_HEIGHT - 1, 3, 0x33FFFFFF);
+			context.drawText(client.textRenderer, client.textRenderer.trimToWidth(title.getString(), WINDOW_WIDTH - 148), x + 8, y + 5, 0xFF5A5A5A, false);
+			drawSmallButton(context, mouseX, mouseY, backgroundX(), titleButtonY(), TOOL_BUTTON_WIDTH, WINDOW_CLOSE_SIZE, Text.literal(NestedChestClientConfig.backgroundMode().shortLabel()), backgroundContains(mouseX, mouseY));
+			drawSmallButton(context, mouseX, mouseY, sortX(), titleButtonY(), TOOL_BUTTON_WIDTH, WINDOW_CLOSE_SIZE, Text.literal(sortMode.shortLabel), sortContains(mouseX, mouseY));
+			drawSmallButton(context, mouseX, mouseY, sortDirectionX(), titleButtonY(), TOOL_BUTTON_WIDTH, WINDOW_CLOSE_SIZE, Text.literal(sortAscending ? "正" : "倒"), sortDirectionContains(mouseX, mouseY));
+			drawSmallButton(context, mouseX, mouseY, extraX(), titleButtonY(), EXTRA_BUTTON_WIDTH, WINDOW_CLOSE_SIZE, Text.literal("+"), extraContains(mouseX, mouseY));
+			drawSmallButton(context, mouseX, mouseY, closeX(), titleButtonY(), WINDOW_CLOSE_SIZE, WINDOW_CLOSE_SIZE, Text.literal("x"), closeContains(mouseX, mouseY));
+
+			int navY = y + TITLE_BAR_HEIGHT + 4;
+			drawSmallButton(context, mouseX, mouseY, backX(), navY + 1, BACK_BUTTON_SIZE, BACK_BUTTON_SIZE, Text.literal("<"), backContains(mouseX, mouseY));
+			fillRoundedRect(context, pathFieldX() - 1, pathFieldY() - 1, pathFieldWidth() + 2, PATH_FIELD_HEIGHT + 2, 3, 0x55919191);
+			fillRoundedRect(context, pathFieldX(), pathFieldY(), pathFieldWidth(), PATH_FIELD_HEIGHT, 3, 0xFFD6D6D6);
+			context.drawHorizontalLine(pathFieldX() + 2, pathFieldX() + pathFieldWidth() - 3, pathFieldY(), 0xFF8A8A8A);
+			if (pathField != null && pathFieldWindow == this) {
+				pathField.render(context, mouseX, mouseY, 0.0F);
+			}
 
 			int gridX = x + PADDING;
-			int gridY = y + TITLE_BAR_HEIGHT + PADDING;
+			int gridY = y + TITLE_BAR_HEIGHT + NAV_BAR_HEIGHT + PADDING;
+			int gridPanelX = gridX - 4;
+			int gridPanelY = gridY - 4;
+			int gridPanelWidth = GRID_WIDTH + 8;
+			int gridPanelHeight = rows() * SLOT_SIZE + 8;
+			fillRoundedRect(context, gridPanelX, gridPanelY, gridPanelWidth, gridPanelHeight, PANEL_RADIUS, 0xFF9A9A9A);
+			drawRoundedBorder(context, gridPanelX, gridPanelY, gridPanelWidth, gridPanelHeight, PANEL_RADIUS, 0xFF5E5E5E, 0xFFE7E7E7);
+			fillRoundedRect(context, gridPanelX + 2, gridPanelY + 2, gridPanelWidth - 4, gridPanelHeight - 4, PANEL_RADIUS - 1, 0xFFAEAEAE);
+			boolean customGridBackground = drawGridBackgroundImage(context, gridX, gridY, GRID_WIDTH, rows() * SLOT_SIZE);
 			for (int slot = 0; slot < stacks.size(); slot++) {
 				int slotX = gridX + (slot % GRID_COLUMNS) * SLOT_SIZE;
 				int slotY = gridY + (slot / GRID_COLUMNS) * SLOT_SIZE;
-				context.fill(slotX, slotY, slotX + 18, slotY + 18, 0xFF8B8B8B);
-				context.fill(slotX + 1, slotY + 1, slotX + 17, slotY + 17, 0xFFC6C6C6);
+				drawSlot(context, slotX, slotY, customGridBackground);
 				if (mouseX >= slotX && mouseX < slotX + 18 && mouseY >= slotY && mouseY < slotY + 18) {
-					context.fill(slotX + 1, slotY + 1, slotX + 17, slotY + 17, 0x66FFFFFF);
+					context.fill(slotX + 1, slotY + 1, slotX + 17, slotY + 17, 0x44FFFFFF);
 				}
 				ItemStack stack = stacks.get(slot);
 				if (!stack.isEmpty()) {
@@ -829,16 +1495,44 @@ public final class NestedChestOverlay {
 		}
 
 		private boolean titleContains(double mouseX, double mouseY) {
-			return mouseX >= x && mouseX < x + WINDOW_WIDTH && mouseY >= y && mouseY < y + TITLE_BAR_HEIGHT;
+			return mouseX >= x && mouseX < extraX() && mouseY >= y && mouseY < y + TITLE_BAR_HEIGHT;
 		}
 
 		private boolean closeContains(double mouseX, double mouseY) {
-			return mouseX >= x + WINDOW_WIDTH - 16 && mouseX < x + WINDOW_WIDTH && mouseY >= y && mouseY < y + TITLE_BAR_HEIGHT;
+			return mouseX >= closeX() && mouseX < closeX() + WINDOW_CLOSE_SIZE && mouseY >= titleButtonY() && mouseY < titleButtonY() + WINDOW_CLOSE_SIZE;
+		}
+
+		private boolean extraContains(double mouseX, double mouseY) {
+			return mouseX >= extraX() && mouseX < extraX() + EXTRA_BUTTON_WIDTH && mouseY >= titleButtonY() && mouseY < titleButtonY() + WINDOW_CLOSE_SIZE;
+		}
+
+		private boolean sortContains(double mouseX, double mouseY) {
+			return mouseX >= sortX() && mouseX < sortX() + TOOL_BUTTON_WIDTH && mouseY >= titleButtonY() && mouseY < titleButtonY() + WINDOW_CLOSE_SIZE;
+		}
+
+		private boolean sortDirectionContains(double mouseX, double mouseY) {
+			return mouseX >= sortDirectionX() && mouseX < sortDirectionX() + TOOL_BUTTON_WIDTH && mouseY >= titleButtonY() && mouseY < titleButtonY() + WINDOW_CLOSE_SIZE;
+		}
+
+		private boolean backgroundContains(double mouseX, double mouseY) {
+			return mouseX >= backgroundX() && mouseX < backgroundX() + TOOL_BUTTON_WIDTH && mouseY >= titleButtonY() && mouseY < titleButtonY() + WINDOW_CLOSE_SIZE;
+		}
+
+		private void cycleSortMode() {
+			sortMode = sortMode.next();
+		}
+
+		private boolean backContains(double mouseX, double mouseY) {
+			return mouseX >= backX() && mouseX < backX() + BACK_BUTTON_SIZE && mouseY >= y + TITLE_BAR_HEIGHT + 5 && mouseY < y + TITLE_BAR_HEIGHT + 5 + BACK_BUTTON_SIZE;
+		}
+
+		private boolean pathFieldContains(double mouseX, double mouseY) {
+			return mouseX >= pathFieldX() && mouseX < pathFieldX() + pathFieldWidth() && mouseY >= pathFieldY() && mouseY < pathFieldY() + PATH_FIELD_HEIGHT;
 		}
 
 		private int slotAt(double mouseX, double mouseY) {
 			int gridX = x + PADDING;
-			int gridY = y + TITLE_BAR_HEIGHT + PADDING;
+			int gridY = y + TITLE_BAR_HEIGHT + NAV_BAR_HEIGHT + PADDING;
 			if (mouseX < gridX || mouseY < gridY || mouseX >= gridX + GRID_COLUMNS * SLOT_SIZE || mouseY >= gridY + rows() * SLOT_SIZE) {
 				return -1;
 			}
@@ -856,7 +1550,47 @@ public final class NestedChestOverlay {
 		}
 
 		private int height() {
-			return TITLE_BAR_HEIGHT + PADDING + rows() * SLOT_SIZE + PADDING;
+			return TITLE_BAR_HEIGHT + NAV_BAR_HEIGHT + PADDING + rows() * SLOT_SIZE + PADDING + 4;
+		}
+
+		private int titleButtonY() {
+			return y;
+		}
+
+		private int closeX() {
+			return x + WINDOW_WIDTH - WINDOW_CLOSE_SIZE - 2;
+		}
+
+		private int extraX() {
+			return closeX() - EXTRA_BUTTON_WIDTH - 2;
+		}
+
+		private int sortDirectionX() {
+			return extraX() - TOOL_BUTTON_WIDTH - 2;
+		}
+
+		private int sortX() {
+			return sortDirectionX() - TOOL_BUTTON_WIDTH - 2;
+		}
+
+		private int backgroundX() {
+			return sortX() - TOOL_BUTTON_WIDTH - 2;
+		}
+
+		private int backX() {
+			return x + PADDING;
+		}
+
+		private int pathFieldX() {
+			return x + PADDING + BACK_BUTTON_SIZE + 4;
+		}
+
+		private int pathFieldY() {
+			return y + TITLE_BAR_HEIGHT + 4;
+		}
+
+		private int pathFieldWidth() {
+			return WINDOW_WIDTH - PADDING * 2 - BACK_BUTTON_SIZE - 4;
 		}
 
 		private void clampToScreen() {
@@ -896,11 +1630,10 @@ public final class NestedChestOverlay {
 			layout();
 			MinecraftClient client = MinecraftClient.getInstance();
 			context.fill(0, 0, client.getWindow().getScaledWidth(), client.getWindow().getScaledHeight(), 0x55000000);
-			context.fill(x + 2, y + 3, x + RENAME_WIDTH + 2, y + RENAME_HEIGHT + 3, 0x66000000);
-			context.fill(x, y, x + RENAME_WIDTH, y + RENAME_HEIGHT, 0xFFF7F7F7);
-			context.fill(x, y, x + RENAME_WIDTH, y + TITLE_BAR_HEIGHT, 0xFF3A4D5F);
-			context.drawText(client.textRenderer, Text.literal("重命名箱子"), x + 8, y + 5, 0xFFFFFFFF, false);
-			context.drawBorder(x, y, RENAME_WIDTH, RENAME_HEIGHT, 0xFF202830);
+			drawPanel(context, x, y, RENAME_WIDTH, RENAME_HEIGHT);
+			fillRoundedRect(context, x + 3, y + 3, RENAME_WIDTH - 6, TITLE_BAR_HEIGHT - 1, 3, 0x33FFFFFF);
+			context.drawText(client.textRenderer, Text.literal("重命名箱子"), x + 8, y + 6, 0xFF5A5A5A, false);
+			fillRoundedRect(context, x + 9, y + 27, RENAME_WIDTH - 18, 22, 3, 0x55919191);
 			nameField.render(context, mouseX, mouseY, 0.0F);
 			drawButton(context, mouseX, mouseY, cancelX(), buttonY(), Text.literal("取消"));
 			drawButton(context, mouseX, mouseY, doneX(), buttonY(), Text.literal("确定"));
@@ -938,6 +1671,11 @@ public final class NestedChestOverlay {
 			return true;
 		}
 
+		private boolean charTyped(char chr, int modifiers) {
+			nameField.charTyped(chr, modifiers);
+			return true;
+		}
+
 		private int cancelX() {
 			return x + 10;
 		}
@@ -951,12 +1689,7 @@ public final class NestedChestOverlay {
 		}
 
 		private void drawButton(DrawContext context, int mouseX, int mouseY, int buttonX, int buttonY, Text label) {
-			MinecraftClient client = MinecraftClient.getInstance();
-			boolean hovered = buttonContains(mouseX, mouseY, buttonX, buttonY);
-			int color = hovered ? 0xFF5A6E80 : 0xFF465A6C;
-			context.fill(buttonX, buttonY, buttonX + RENAME_BUTTON_WIDTH, buttonY + RENAME_BUTTON_HEIGHT, color);
-			context.drawBorder(buttonX, buttonY, RENAME_BUTTON_WIDTH, RENAME_BUTTON_HEIGHT, 0xFF202830);
-			context.drawCenteredTextWithShadow(client.textRenderer, label, buttonX + RENAME_BUTTON_WIDTH / 2, buttonY + 6, 0xFFFFFFFF);
+			drawSmallButton(context, mouseX, mouseY, buttonX, buttonY, RENAME_BUTTON_WIDTH, RENAME_BUTTON_HEIGHT, label, buttonContains(mouseX, mouseY, buttonX, buttonY));
 		}
 
 		private boolean buttonContains(double mouseX, double mouseY, int buttonX, int buttonY) {
@@ -983,5 +1716,22 @@ public final class NestedChestOverlay {
 	}
 
 	private record ContainerView(Text title, DefaultedList<ItemStack> stacks) {
+	}
+
+	private enum SortMode {
+		NAME("名"),
+		COUNT("数"),
+		CATEGORY("类");
+
+		private final String shortLabel;
+
+		SortMode(String shortLabel) {
+			this.shortLabel = shortLabel;
+		}
+
+		private SortMode next() {
+			SortMode[] values = values();
+			return values[(ordinal() + 1) % values.length];
+		}
 	}
 }
