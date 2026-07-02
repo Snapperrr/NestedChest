@@ -1681,7 +1681,7 @@ public final class NestedChestOverlay {
 			MinecraftClient client = MinecraftClient.getInstance();
 			this.screen = screen;
 			this.path = List.copyOf(path);
-			this.nameField = new TextFieldWidget(client.textRenderer, 0, 0, RENAME_WIDTH - 20, 20, Text.literal("鍚嶇О"));
+			this.nameField = new TextFieldWidget(client.textRenderer, 0, 0, RENAME_WIDTH - 20, 20, Text.literal("名称"));
 			this.nameField.setMaxLength(NestedChestMod.MAX_CHEST_NAME_LENGTH);
 			this.nameField.setText(stack.contains(DataComponentTypes.CUSTOM_NAME) ? stack.getName().getString() : "");
 			this.nameField.setPlaceholder(stack.getName());
@@ -1705,8 +1705,8 @@ public final class NestedChestOverlay {
 			context.drawText(client.textRenderer, Text.literal("重命名箱子"), x + 8, y + 6, 0xFF5A5A5A, false);
 			fillRoundedRect(context, x + 9, y + 27, RENAME_WIDTH - 18, 22, 3, 0x55919191);
 			nameField.render(context, mouseX, mouseY, 0.0F);
-			drawButton(context, mouseX, mouseY, cancelX(), buttonY(), Text.literal("鍙栨秷"));
-			drawButton(context, mouseX, mouseY, doneX(), buttonY(), Text.literal("纭畾"));
+			drawButton(context, mouseX, mouseY, cancelX(), buttonY(), Text.literal("取消"));
+			drawButton(context, mouseX, mouseY, doneX(), buttonY(), Text.literal("确认"));
 		}
 
 		private boolean mouseClicked(double mouseX, double mouseY, int button) {
