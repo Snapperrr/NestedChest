@@ -46,6 +46,7 @@ public abstract class HopperBlockEntityMixin {
 		ConnectedChestInventory connectedInventory = ConnectedChestFinder.find(world, pos);
 		if (connectedInventory.chestCount() > 1) {
 			// 漏斗看到的是整个连接箱子组，而不是某一个单独 ChestBlockEntity。
+			// EN: Hoppers target the connected inventory view, not the single touched ChestBlockEntity.
 			cir.setReturnValue(connectedInventory);
 		}
 	}

@@ -29,6 +29,7 @@ public class ConnectedChestInventory implements Inventory {
 		this.world = world;
 		this.chests = new ArrayList<>(chests);
 		// 固定排序决定“第几个箱子对应哪 27 格”，避免每次打开顺序变化导致物品看起来乱跳。
+		// EN: Stable ordering keeps each physical chest mapped to the same 27-slot page across opens.
 		this.chests.sort(Comparator
 				.comparingInt((ChestBlockEntity chest) -> chest.getPos().getY())
 				.thenComparingInt(chest -> chest.getPos().getZ())
